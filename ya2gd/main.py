@@ -6,7 +6,7 @@ import time
 
 from . import __version__, winsys
 from .core import data_dir
-from .engine import Engine
+from .profiles import Manager
 from .web import serve
 
 BANNER = """
@@ -45,12 +45,13 @@ def main():
         time.sleep(2)
         return
 
-    engine = Engine(ddir)
+    manager = Manager(ddir)
+    engine = manager.main
     port = args.port or engine.settings["port"]
     try:
-        httpd = serve(engine, port)
+        httpd = serve(manager, port)
     except OSError:
-        httpd = serve(engine, 0)            # порт занят чужой программой — берём любой свободный
+        httpd = serve(manager, 0)           # порт занят чужой программой — берём любой свободный
         engine.log(f"Порт {port} занят другой программой, интерфейс на порту {httpd.server_address[1]}", "warn")
     port = httpd.server_address[1]
     with open(port_file, "w") as f:
@@ -60,16 +61,8 @@ def main():
     engine.log(f"Интерфейс: {url}. Данные и журнал: {ddir}")
     winsys.set_title(f"Яндекс → Google — НЕ закрывайте это окно ({url})")
 
-    if engine.settings["autostart"]:
-        if engine.db.get("scan.state") in ("interrupted", "stopped") and engine.settings["yandex_token"]:
-            engine.log("Автозапуск: продолжаю прерванное получение списка")
-            engine.start_scan()
-        if engine.db.get("transfer.wanted") == "1":
-            engine.log("Автозапуск: продолжаю перенос")
-            try:
-                engine.start_transfer()
-            except Exception as e:  # noqa
-                engine.log(f"Автозапуск не удался: {e}", "error")
+    manager.autostart()
+    manager.run()                           # очередь профилей, «Старт» в ожидании, повтор по расписанию
 
     if not args.no_browser:
         def show():
@@ -81,8 +74,10 @@ def main():
         httpd.serve_forever()
     except KeyboardInterrupt:
         engine.log("Остановка по Ctrl+C")
-        engine.stop_scanning()
-        engine.pause_transfer("закрытие программы", by_user=False)
+        manager.close()
+        for e in manager.engines.values():
+            e.stop_scanning()
+            e.pause_transfer("закрытие программы", by_user=False)
         winsys.allow_sleep()
 
 

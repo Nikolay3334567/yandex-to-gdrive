@@ -22,7 +22,7 @@ LEGAL = {"license": "LICENSE", "license-ru": "LICENSE.ru.txt", "third-party": "T
 
 
 class Handler(BaseHTTPRequestHandler):
-    engine = None
+    manager = None                       # profiles.Manager: все профили; запрос работает с выбранным в окне
     server_version = "ya2gd"
 
     def log_message(self, fmt, *args):
@@ -55,6 +55,11 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(n).decode("utf-8"))
 
+    def _pid(self, qs):
+        """Профиль, с которым работает окно: заголовок X-Ya2gd-Profile или ?profile= (для ссылок)."""
+        pid = self.headers.get("X-Ya2gd-Profile") or qs.get("profile") or ""
+        return pid if self.manager.has(pid) else "main"
+
     def _base(self):
         return f"http://127.0.0.1:{self.server.server_address[1]}"
 
@@ -62,7 +67,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         qs = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
-        e = self.engine
+        m = self.manager
+        pid = self._pid(qs)
+        e = m.get(pid)
         try:
             if u.path in ("/", "/index.html"):
                 with open(os.path.join(STATIC, "index.html"), "rb") as f:
@@ -71,7 +78,30 @@ class Handler(BaseHTTPRequestHandler):
                 st = e.status()
                 st["version"] = __version__
                 st["data_dir"] = e.dir
+                st["profile"] = {"id": pid, "name": m.name(pid)}
+                st["deferred"] = e.deferred_info()
+                pl = m.listing()
+                st["profiles"] = [{k: p[k] for k in ("id", "name", "state", "running", "waiting")}
+                                  for p in pl["profiles"]]
+                st["queue"] = pl["queue"]
                 return self._send(200, st)
+            if u.path == "/api/profiles":
+                return self._send(200, m.listing())
+            if u.path == "/api/export/map":
+                tmp = os.path.join(m.root, f"export-{os.getpid()}-{time.time_ns()}.sqlite3")
+                try:
+                    e.export_map(tmp)
+                    with open(tmp, "rb") as f:
+                        data = f.read()
+                finally:
+                    for x in (tmp, tmp + "-journal"):
+                        try:
+                            os.remove(x)
+                        except OSError:
+                            pass
+                name = f"ya2gd-map-{pid}-{time.strftime('%Y%m%d-%H%M')}.sqlite3"
+                return self._send(200, data, "application/octet-stream",
+                                  {"Content-Disposition": f'attachment; filename="{name}"'})
             if u.path == "/api/drives":
                 return self._send(200, winsys.list_drives())
             if u.path == "/api/settings":
@@ -101,13 +131,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, "Сначала сохраните Client ID и Client secret", "text/plain; charset=utf-8")
                 return self._redirect(auth.auth_url(self._base() + "/oauth/google/callback", e.google_state))
             if u.path == "/oauth/google/callback":
-                return self._google_callback(qs)
+                # профиль — по state: его выдал тот профиль, из окна которого нажали «Войти в Google»
+                e = next((x for x in m.engines.values() if x.google_state == qs.get("state")), e)
+                return self._google_callback(e, qs)
             return self._send(404, {"error": "not found"})
         except Exception as ex:  # noqa
             return self._error(ex)
 
-    def _google_callback(self, qs):
-        e = self.engine
+    def _google_callback(self, e, qs):
         if qs.get("error"):
             return self._send(400, _page(f"Google вернул ошибку: {qs['error']}"), "text/html; charset=utf-8")
         if qs.get("state") != e.google_state:
@@ -119,6 +150,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             info = e.test_google()
             e.settings.update(google_email=info.get("email") or "")
+            self.manager.accounts.label_if_default("google", e.settings["google_account"], info.get("email"))
             msg = f"Google подключён: {info.get('email')}. Запись проверена. Окно можно закрыть."
         except Exception as ex:  # noqa
             msg = f"Токен получен, но проверка не прошла: {ex}"
@@ -130,9 +162,29 @@ class Handler(BaseHTTPRequestHandler):
         # Защита от запросов с чужих сайтов: браузер не даст им выставить этот заголовок без CORS.
         if self.headers.get("X-Ya2gd") != "1":
             return self._send(403, {"error": "forbidden"})
-        e = self.engine
-        p = urllib.parse.urlparse(self.path).path
+        u = urllib.parse.urlparse(self.path)
+        p = u.path
+        qs = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+        m = self.manager
+        pid = self._pid(qs)
+        e = m.get(pid)
         try:
+            if p == "/api/import/upload":                 # файл карты прямо из окна (тело — сам файл)
+                n = int(self.headers.get("Content-Length") or 0)
+                if not n or n > 2 * 1024 ** 3:
+                    raise ApiError("Пустой или слишком большой файл")
+                d = os.path.join(m.root, "imports")
+                os.makedirs(d, exist_ok=True)
+                dst = os.path.join(d, f"upload-{time.strftime('%Y%m%d-%H%M%S')}.sqlite3")
+                left = n
+                with open(dst, "wb") as f:
+                    while left:
+                        chunk = self.rfile.read(min(left, 1 << 20))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        left -= len(chunk)
+                return self._send(200, m.inspect_import(dst))
             b = self._body()
             if p == "/api/settings":
                 clean = {k: v for k, v in b.items() if not (k.endswith("_set"))}
@@ -142,6 +194,8 @@ class Handler(BaseHTTPRequestHandler):
                         clean.pop(k)
                 if "google_client_id" in clean and clean["google_client_id"] != e.settings["google_client_id"]:
                     clean.setdefault("google_refresh_token", "")
+                if clean.get("deferred_auto") and clean["deferred_auto"] != e.settings["deferred_auto"]:
+                    e.db.set("deferred.auto_since", time.time())    # первый повтор — через выбранный срок
                 e.settings.update(**clean)
                 e.sync_sections()
                 if "buffer_dir" in clean and e.transferring():
@@ -150,21 +204,26 @@ class Handler(BaseHTTPRequestHandler):
                     winsys.set_autorun(e.settings["win_autorun"])
                 return self._send(200, e.settings.public())
             if p == "/api/pick_folder":
-                return self._send(200, {"path": winsys.pick_folder(b.get("initial") or "")})
+                args = [b.get("initial") or ""] + ([b["title"]] if b.get("title") else [])
+                return self._send(200, {"path": winsys.pick_folder(*args)})
             if p == "/api/buffer/check":
                 return self._send(200, _check_buffer(b.get("path") or ""))
             if p == "/api/actions/previews":
                 e.rescue_previews()
                 return self._send(200, {"ok": True})
             if p == "/api/quit":
-                threading.Thread(target=_quit, args=(e,), daemon=True).start()
+                threading.Thread(target=_quit, args=(m,), daemon=True).start()
                 return self._send(200, {"ok": True})
             if p == "/api/yandex/test":
-                return self._send(200, e.test_yandex())
+                r = e.test_yandex()
+                m.accounts.label_if_default("yandex", e.settings["yandex_account"], r.get("user"))
+                return self._send(200, r)
             if p == "/api/yandex/web_test":
                 return self._send(200, e.test_yandex_web())
             if p == "/api/google/test":
-                return self._send(200, e.test_google())
+                r = e.test_google()
+                m.accounts.label_if_default("google", e.settings["google_account"], r.get("email"))
+                return self._send(200, r)
             if p == "/api/google/logout":
                 e.settings.update(google_refresh_token="", google_email="")
                 return self._send(200, {"ok": True})
@@ -175,7 +234,7 @@ class Handler(BaseHTTPRequestHandler):
                 e.stop_scanning()
                 return self._send(200, {"ok": True})
             if p == "/api/transfer/start":
-                return self._send(200, {"ok": e.start_transfer()})
+                return self._send(200, m.start(pid))
             if p == "/api/transfer/pause":
                 e.pause_transfer()
                 return self._send(200, {"ok": True})
@@ -200,6 +259,63 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/task/stop":
                 e.stop_task()
                 return self._send(200, {"ok": True})
+            if p == "/api/deferred/retry":            # «Повторить отложенные»: в очередь и сразу перенос
+                n = e.retry_errors()
+                r = m.start(pid) if n and not e.transferring() else {"ok": e.transferring(), "queued": False}
+                return self._send(200, dict(r, n=n))
+            # ---------- профили и аккаунты
+            if p == "/api/profiles/create":
+                return self._send(200, {"id": m.create(b.get("name", ""), b.get("yandex_account", ""),
+                                                       b.get("google_account", ""), b.get("copy_from") or pid)})
+            if p == "/api/profiles/rename":
+                m.rename(b["id"], b.get("name", ""))
+                return self._send(200, {"ok": True})
+            if p == "/api/profiles/delete":
+                m.delete(b["id"])
+                return self._send(200, {"ok": True})
+            if p == "/api/profiles/move":
+                m.move(b["id"], b.get("delta", 0))
+                return self._send(200, {"ok": True})
+            if p == "/api/profiles/queue_flag":
+                m.set_queue(b["id"], b.get("on"))
+                return self._send(200, {"ok": True})
+            if p == "/api/queue/start":
+                m.queue_start()
+                return self._send(200, {"ok": True})
+            if p == "/api/queue/stop":
+                m.queue_stop()
+                return self._send(200, {"ok": True})
+            if p == "/api/profile/accounts":              # выбрать аккаунт из библиотеки для этого профиля
+                upd = {k: b[k] for k in ("yandex_account", "google_account")
+                       if k in b and (not b[k] or m.accounts.exists(k[:-8], b[k]))}
+                e.settings.update(**upd)
+                return self._send(200, e.settings.public())
+            if p == "/api/accounts/create":               # новый пустой аккаунт — сразу в этот профиль
+                kind = b.get("kind")
+                if kind not in ("yandex", "google"):
+                    raise ApiError("Неизвестный вид аккаунта")
+                creds = {}
+                if kind == "google":                       # тот же проект Google Cloud — другой вход
+                    src = b.get("client_from") or ""
+                    if m.accounts.exists("google", src):
+                        creds = {k: m.accounts.get("google", src, k) for k in ("google_client_id", "google_client_secret")}
+                    elif b.get("copy_client", True):
+                        creds = {k: e.settings[k] for k in ("google_client_id", "google_client_secret")}
+                aid = m.accounts.create(kind, label=b.get("label", ""), **creds)
+                e.settings.update(**{kind + "_account": aid})
+                return self._send(200, {"id": aid})
+            if p == "/api/accounts/rename":
+                m.accounts.rename(b["kind"], b["id"], b.get("label", ""))
+                return self._send(200, {"ok": True})
+            if p == "/api/accounts/delete":
+                m.delete_account(b["kind"], b["id"])
+                return self._send(200, {"ok": True})
+            # ---------- перенос из прошлой версии
+            if p == "/api/import/inspect":
+                return self._send(200, m.inspect_import(b.get("path", "")))
+            if p == "/api/import/apply":
+                return self._send(200, m.import_old(b.get("path", ""), pid, b.get("target", "auto"),
+                                                    b.get("name", ""), b.get("with_accounts", True)))
             if p == "/api/files/action":
                 e.file_action(int(b["id"]), b["action"])
                 return self._send(200, {"ok": True})
@@ -209,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _error(self, ex):
         if not isinstance(ex, ApiError):
-            self.engine.log(traceback.format_exc(), "debug")
+            self.manager.main.log(traceback.format_exc(), "debug")
         return self._send(400 if isinstance(ex, ApiError) else 500, {"error": str(ex)})
 
 
@@ -240,15 +356,17 @@ def _check_buffer(path):
             "msg": f"Папка доступна, свободно {du.free / 2**30:.1f} ГБ из {du.total / 2**30:.1f} ГБ"}
 
 
-def _quit(engine):
-    engine.log("Выход по команде из окна программы: останавливаю перенос…")
-    engine.stop_scanning()
-    engine.stop_task()
-    engine.pause_transfer("выход из программы", by_user=False)
+def _quit(manager):
+    manager.main.log("Выход по команде из окна программы: останавливаю перенос…")
+    manager.close()
+    for engine in manager.engines.values():
+        engine.stop_scanning()
+        engine.stop_task()
+        engine.pause_transfer("выход из программы", by_user=False)
     t0 = time.time()
-    while engine.transferring() and time.time() - t0 < 60:
+    while any(x.transferring() for x in manager.engines.values()) and time.time() - t0 < 60:
         time.sleep(0.5)
-    engine.log("Программа закрыта. Прогресс сохранён — при следующем запуске всё продолжится.")
+    manager.main.log("Программа закрыта. Прогресс сохранён — при следующем запуске всё продолжится.")
     winsys.allow_sleep()
     time.sleep(0.5)
     os._exit(0)
@@ -260,6 +378,6 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
 
-def serve(engine, port):
-    Handler.engine = engine
+def serve(manager, port):
+    Handler.manager = manager
     return _Server(("127.0.0.1", port), Handler)

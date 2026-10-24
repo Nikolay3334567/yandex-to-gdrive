@@ -41,7 +41,9 @@ class GoogleAuth:
     def auth_url(self, redirect_uri, state):
         return AUTH_URL + "?" + urllib.parse.urlencode({
             "client_id": self.client_id, "redirect_uri": redirect_uri, "response_type": "code",
-            "scope": SCOPE + " openid email", "access_type": "offline", "prompt": "consent",
+            "scope": SCOPE + " openid email", "access_type": "offline",
+            # select_account — Google спросит, каким аккаунтом войти (у профилей их может быть несколько)
+            "prompt": "consent select_account",
             "state": state, "include_granted_scopes": "true"})
 
     def exchange_code(self, code, redirect_uri):

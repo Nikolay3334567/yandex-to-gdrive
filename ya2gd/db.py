@@ -17,6 +17,7 @@
 Метка разметки (probe): ok — Яндекс отдаёт файл, slow — отдаёт «по капле», dead — не отдаёт,
 missing — файла нет на Яндексе, NULL — не проверялся (см. probe.py).
 """
+import os
 import sqlite3
 import threading
 import time
@@ -72,6 +73,7 @@ EXTRA_COLS = {
     "probe_ms": "INTEGER",                   # задержка: ссылка + первый ответ Яндекса, мс
     "probe_bps": "REAL",                     # скорость при пробе, байт/с
     "probe_note": "TEXT",
+    "retry_batch": "INTEGER",                # номер последнего повтора «Отложенных», в который попал файл
 }
 
 FILE_COLS = ("path", "source", "name", "size", "md5", "sha256", "modified",
@@ -111,6 +113,70 @@ class DB:
     def close(self):
         with self._lock:
             self.conn.close()
+
+    # ---------- карта файлов: экспорт и импорт ----------
+    def backup_to(self, dst):
+        """Целостная копия базы на ходу (SQLite backup): её откроет и эта, и прошлая версия программы."""
+        with self._lock:
+            out = sqlite3.connect(dst)
+            try:
+                self.conn.backup(out)
+            finally:
+                out.close()
+
+    def import_from(self, src, snap, auto_retry=False, with_folders=True):
+        """Добавить файлы из другой базы (прошлой версии или экспорта карты). Сначала — снимок источника
+        (он может быть открыт работающей прошлой версией), в снимке статусы приводятся к правилам этой версии,
+        потом строки, которых здесь ещё нет (по пути на Яндексе), добавляются одним запросом."""
+        if not os.path.isfile(src):
+            raise FileNotFoundError(src)
+        s = sqlite3.connect(src, timeout=30)
+        try:
+            d = sqlite3.connect(snap)
+            try:
+                s.backup(d)
+            finally:
+                d.close()
+        finally:
+            s.close()
+        c = sqlite3.connect(snap)
+        try:
+            tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "files" not in tables:
+                raise ValueError("в файле нет карты файлов этой программы")
+            cols = {r[1] for r in c.execute("PRAGMA table_info(files)")}
+            if not {"path", "source", "name", "size", "status"} <= cols:
+                raise ValueError("в файле нет карты файлов этой программы")
+            kv = dict(c.execute("SELECT key, value FROM kv").fetchall()) if "kv" in tables else {}
+            now = time.time()
+            # версия 2 откладывала недоступные файлы «на потом» в статусе pending — теперь это «Отложенные»
+            if "defers" in cols and kv.get("files.v3") != "1":
+                c.execute("UPDATE files SET status='deferred', next_try=0 WHERE status='pending' AND defers>0 "
+                          "AND next_try>?", (now,))
+            # что было «в работе» или в буфере прошлой версии — снова в очередь (буфер у неё свой)
+            c.execute("UPDATE files SET status='pending' WHERE status IN ('active','buffered','uploading')")
+            if "local_path" in cols:
+                c.execute("UPDATE files SET local_path=NULL")
+            if not auto_retry:
+                c.execute("UPDATE files SET next_try=? WHERE status='error' AND next_try<?", (FOREVER, FOREVER))
+            by_status = dict(c.execute("SELECT status, COUNT(*) FROM files GROUP BY status").fetchall())
+            total = sum(by_status.values())
+            c.commit()
+        finally:
+            c.close()
+        with self._lock:
+            mine = [r[1] for r in self.conn.execute("PRAGMA table_info(files)") if r[1] != "id"]
+            common = ",".join(x for x in mine if x in cols)
+            before = self.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            self.conn.execute("ATTACH DATABASE ? AS imp", (snap,))
+            try:
+                self.conn.execute(f"INSERT OR IGNORE INTO files ({common}) SELECT {common} FROM imp.files")
+                if with_folders and "folders" in tables:
+                    self.conn.execute("INSERT OR IGNORE INTO folders(path, gd_id) SELECT path, gd_id FROM imp.folders")
+            finally:
+                self.conn.execute("DETACH DATABASE imp")
+            after = self.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        return {"added": after - before, "total": total, "by_status": by_status, "kv": kv}
 
     # ---------- низкоуровневое ----------
     def q(self, sql, args=()):

@@ -13,6 +13,8 @@
    сразу в «Отложенных», потоки не падают; когда не отдаётся ничего — пауза, а не откладывание.
 5. Пробный замер на серии файлов разных типов, разметка всех файлов (остановка и продолжение),
    «Отложить недоступные по разметке», расчёт времени; перенос после разметки.
+6. Профили: общая библиотека аккаунтов, очередь профилей друг за другом, «Старт» во время чужого
+   переноса, кнопка «Повторить отложенные» и повтор по расписанию, экспорт карты и перенос из прошлой версии.
 
 Запуск: python tests/test_e2e.py
 """
@@ -560,6 +562,125 @@ def scenario_probe(e):
     print("OK «Отложить недоступные по разметке»: перенос их не трогает; после «Повторить» перенесено всё")
 
 
+def raw(method, url, data=None, headers=None):
+    req = urllib.request.Request(url, data=data, method=method, headers=dict({"X-Ya2gd": "1"}, **(headers or {})))
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read()
+
+
+def scenario_profiles(e):
+    app, M = e.app, e.M
+    app.start()
+
+    def P(path, pid):
+        return path + ("&" if "?" in path else "?") + "profile=" + pid
+
+    def by_status(pid):
+        return app.get(P("/api/status", pid))["stats"]["by_status"]
+
+    def count(pid, st):
+        return by_status(pid).get(st, {}).get("count", 0)
+
+    app.post("/api/settings", dict(GOOD, yandex_cookies=COOKIES, terms_accepted=True))
+    lib = app.get("/api/profiles")["accounts"]
+    ya, g = lib["yandex"][0]["id"], lib["google"][0]["id"]
+    code, r = app.post("/api/profiles/create", {"name": "Второй", "yandex_account": ya, "google_account": g})
+    assert code == 200, r
+    p2 = r["id"]
+    app.post(P("/api/settings", p2), {"photos_root": "Фото2", "files_root": "Файлы2", "previews_root": "Превью2"})
+    s2 = app.get(P("/api/settings", p2))
+    assert s2["yandex_token_set"] and s2["google_refresh_token_set"] and s2["photos_root"] == "Фото2", s2
+    assert s2["terms_accepted"] is True                                   # общие настройки программы
+    print("OK второй профиль: аккаунты Яндекса и Google выбраны из библиотеки, без повторного ввода")
+
+    dead = "disk:/Документы/отчёт.pdf"
+    e.faults(dead=[dead])
+    ya_files = http("GET", M + "/ctl/ya")[1]
+    for pid in ("main", p2):
+        app.post(P("/api/scan/start", pid), {"fresh": True})
+        wait_for(lambda: app.get(P("/api/status", pid))["scan"]["state"] == "done", 60, f"scan {pid}")
+    app.post("/api/queue/start")
+    wait_for(lambda: not app.get("/api/profiles")["queue"]["active"], 300, "очередь профилей")
+    for pid in ("main", p2):
+        assert count(pid, "done") == len(ya_files) - 1 and count(pid, "deferred") == 1, (pid, by_status(pid))
+    assert app.logfile_has("Очередь профилей пройдена")
+    names = {f["name"] for f in e.drive().values() if f["folder"]}
+    assert {"Файлы с Яндекс Диска", "Файлы2", "Фото", "Фото2"} <= names, names
+    print("OK очередь: оба профиля перенесены друг за другом, каждый в свои папки; недоступный файл — в «Отложенных» у обоих")
+
+    # «Старт» второго, пока переносит основной: второй ждёт и начинается сам
+    http("POST", M + "/ctl/add_files", {"prefix": "disk:/Новое/n", "count": 12, "size": 300_000})
+    for pid in ("main", p2):
+        app.post(P("/api/scan/start", pid), {"fresh": False})
+        wait_for(lambda: app.get(P("/api/status", pid))["scan"]["state"] == "done", 60, f"rescan {pid}")
+    e.faults(slow=0.02)
+    app.post("/api/transfer/start")
+    code, r = app.post(P("/api/transfer/start", p2))
+    assert r.get("queued") and r.get("after") == "Основной", r
+    e.faults(slow=0)
+    wait_for(lambda: count(p2, "done") == len(ya_files) - 1 + 12 and app.get(P("/api/status", p2))["transfer"]["state"]
+             in ("done",), 240, "второй после основного")
+    print("OK «Старт» во время чужого переноса: профиль подождал и начался сам")
+
+    # кнопка «Повторить отложенные»: файлы снова в очереди, перенос стартует сам, виден итог повтора
+    e.faults(dead=[])
+    code, r = app.post(P("/api/deferred/retry", p2))
+    assert r["n"] == 1 and r["ok"], r
+    wait_for(lambda: (app.get(P("/api/status", p2))["deferred"]["retry"] or {}).get("finished"), 120, "повтор")
+    rt = app.get(P("/api/status", p2))["deferred"]["retry"]
+    assert rt["total"] == 1 and rt["done"] == 1 and count(p2, "deferred") == 0, rt
+    print("OK «Повторить отложенные»: перенос запустился сам, итог повтора виден (перенесено 1 из 1)")
+
+    # повтор по расписанию у основного профиля: «раз в день», последний — давно
+    app.post("/api/settings", {"deferred_auto": "day"})
+    import sqlite3
+    c = sqlite3.connect(os.path.join(e.ddir, "state.sqlite3"), timeout=30)
+    c.execute("INSERT OR REPLACE INTO kv(key, value) VALUES('deferred.auto_since', '0'), ('deferred.last_retry', '0')")
+    c.commit()
+    c.close()
+    wait_for(lambda: count("main", "deferred") == 0 and count("main", "done") == len(ya_files) + 12
+             and app.state() == "done", 120, "повтор по расписанию")
+    assert app.logfile_has("Повтор отложенных по расписанию (раз в день)")
+    nxt = app.get("/api/status")["deferred"]["next_auto"]
+    assert nxt and nxt > time.time() + 80000, nxt
+    print("OK повтор отложенных по расписанию: сам вернул файл в очередь и перенёс; следующий — через сутки")
+
+    # ссылки на Яндекс Диск — в отчёте
+    csv_text = raw("GET", app.u("/api/report.csv")).decode("utf-8-sig")
+    assert "https://disk.yandex.ru/client/disk/%D0%9D%D0%BE%D0%B2%D0%BE%D0%B5?idApp=client&dialog=slider" in csv_text
+    # экспорт карты и её импорт в новый профиль: файлы не качаются заново
+    data = raw("GET", app.u("/api/export/map"))
+    assert data.startswith(b"SQLite format 3"), data[:20]
+    info = json.loads(raw("POST", app.u("/api/import/upload"), data, {"Content-Type": "application/octet-stream"}))
+    assert info["files"] == len(ya_files) + 12 and info["by_status"]["done"]["count"] == info["files"], info
+    code, res = app.post("/api/import/apply", {"path": info["db"], "target": "new", "with_accounts": False})
+    assert code == 200 and res["added"] == info["files"], res
+    p3 = res["profile"]
+    links = e.stats()["ya_download_links"]
+    app.post(P("/api/profile/accounts", p3), {"yandex_account": ya, "google_account": g})
+    app.post(P("/api/transfer/start", p3))
+    wait_for(lambda: app.get(P("/api/status", p3))["transfer"]["state"] == "done", 60, "импортированный профиль")
+    assert count(p3, "done") == info["files"] and e.stats()["ya_download_links"] == links
+    print("OK экспорт карты и её импорт: новый профиль сразу «всё перенесено», с Яндекса ничего не качалось")
+
+    # перенос из «папки прошлой версии» (data с settings.json и картой): аккаунты те же — без дублей
+    old = os.path.join(e.ddir, "old-version", "data")
+    os.makedirs(old)
+    with open(os.path.join(old, "state.sqlite3"), "wb") as f:
+        f.write(data)
+    with open(os.path.join(old, "settings.json"), "w", encoding="utf-8") as f:
+        json.dump(dict(GOOD, yandex_cookies=COOKIES, google_email="me@example.com"), f)
+    code, info = app.post("/api/import/inspect", {"path": os.path.dirname(old)})
+    assert code == 200 and info["yandex_token"] and info["google_signed_in"] and info["scan"] == "done", info
+    code, res = app.post("/api/import/apply", {"path": info["db"], "target": "new"})
+    assert code == 200 and res["accounts"] == ["google", "yandex"] and res["same_google"], res
+    lib = app.get("/api/profiles")["accounts"]
+    assert len(lib["yandex"]) == 1 and len(lib["google"]) == 1, lib
+    s4 = app.get(P("/api/settings", res["profile"]))
+    assert s4["yandex_account"] == ya and s4["google_account"] == g, s4
+    print("OK перенос из папки прошлой версии: карта и аккаунты подхвачены, вход заново не нужен, дублей аккаунтов нет")
+
+
 def check(app, M):
     """Каждый файл Яндекса лежит на Drive ровно один раз, в правильной папке, с правильным MD5."""
     drive = http("GET", M + "/ctl/drive")[1]
@@ -603,7 +724,8 @@ if __name__ == "__main__":
                  ("buffer", scenario_buffer, {"YA2GD_BUFFER_UNIT": str(2 ** 20)}),
                  ("dead_many", scenario_dead_many, {"YA2GD_FRONT_TIMEOUT": "2", "YA2GD_BREAKER_STREAK": "10",
                                                     "YA2GD_BREAKER_QUIET": "3", "YA2GD_API_COOLDOWN": "2"}),
-                 ("probe", scenario_probe, {"YA2GD_FRONT_TIMEOUT": "2", "YA2GD_SPEEDTEST_SECONDS": "2"})]
+                 ("probe", scenario_probe, {"YA2GD_FRONT_TIMEOUT": "2", "YA2GD_SPEEDTEST_SECONDS": "2"}),
+                 ("profiles", scenario_profiles, {"YA2GD_PROFILES_TICK": "1"})]
     for name, fn, extra in scenarios:
         if only and name not in only:
             continue

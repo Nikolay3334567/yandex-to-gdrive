@@ -83,7 +83,10 @@ a{color:var(--acc)}
   <div class="row" style="justify-content:space-between">
     <div class="row"><h1>Яндекс Диск → Google Drive</h1><span id="stateBadge" class="badge">…</span></div>
     <div class="row">
-      <button class="primary" id="btnStart" onclick="post('/api/transfer/start')">▶ Старт</button>
+      <label class="small" style="margin:0">Профиль</label>
+      <select id="profileSel" style="width:auto;max-width:260px" onchange="switchProfile(this.value)" title="Профиль: какой аккаунт Яндекса куда переносится"></select>
+      <button onclick="openProfiles()" title="Профили, аккаунты, очередь">Профили…</button>
+      <button class="primary" id="btnStart" onclick="startTransfer()">▶ Старт</button>
       <button id="btnPause" onclick="post('/api/transfer/pause')">⏸ Пауза</button>
     </div>
   </div>
@@ -98,6 +101,33 @@ a{color:var(--acc)}
 <div class="wrap">
   <div id="terms"></div>
   <div id="attention"></div>
+
+  <div class="card" id="profilesCard">
+    <details id="profilesBox"><summary><h2 style="display:inline">Профили и аккаунты <span id="profBadge" class="badge"></span></h2></summary>
+    <div class="small muted" style="margin:8px 0">Профиль — это пара «аккаунт Яндекса → аккаунт Google» со своим списком файлов и прогрессом.
+      Аккаунты (токены, куки, входы Google) хранятся в общей библиотеке: их можно выбрать в нескольких профилях из списка, а не вводить заново.
+      Одновременно переносит один профиль; «Старт» другого в это время ставит его в ожидание — он начнётся сам.
+      «Перенести по очереди» переносит отмеченные профили друг за другом.</div>
+    <div style="overflow-x:auto"><table>
+      <thead><tr><th title="Участвует в очереди">В очереди</th><th>Профиль</th><th>Яндекс → Google</th><th>Перенесено</th><th>Отложено</th><th>Состояние</th><th></th></tr></thead>
+      <tbody id="profBody"></tbody>
+    </table></div>
+    <div class="row" style="margin-top:10px" id="queueBox"></div>
+    <h3 style="margin-top:16px">Новый профиль</h3>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 12px">
+      <div><label>Название</label><input id="npName" placeholder="Например: Мамин Диск"></div>
+      <div><label>Аккаунт Яндекса</label><select id="npYa"></select></div>
+      <div><label>Аккаунт Google</label><select id="npG"></select></div>
+    </div>
+    <div class="row" style="margin-top:8px"><button class="primary" onclick="createProfile()">＋ Создать профиль</button>
+      <span class="small muted">Папки на Drive, буфер и потоки копируются из текущего профиля.</span></div>
+    <h3 style="margin-top:16px">Библиотека аккаунтов</h3>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))">
+      <div><b class="small">Яндекс</b><div id="accYa" class="small"></div></div>
+      <div><b class="small">Google</b><div id="accG" class="small"></div></div>
+    </div>
+    </details>
+  </div>
 
   <div class="grid3">
     <div class="card">
@@ -141,6 +171,24 @@ a{color:var(--acc)}
     <div class="tiles" id="tiles"></div>
   </div>
 
+  <div class="card" id="deferredCard">
+    <h2>Отложенные файлы <span id="defBadge" class="badge"></span></h2>
+    <div id="defBody" class="small"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="btnRetry" onclick="retryDeferred()">↻ Повторить отложенные сейчас</button>
+      <label class="small" style="margin:0">Повторять сами:</label>
+      <select id="deferred_auto" style="width:auto" onchange="saveAuto()">
+        <option value="off">нет, только вручную</option><option value="day">раз в день</option>
+        <option value="week">раз в неделю</option><option value="month">раз в месяц</option></select>
+      <span class="small muted" id="defNext"></span>
+    </div>
+    <div class="row small" style="margin-top:8px">
+      <a href="#" onclick="$('fStatus').value='deferred';page=0;loadFiles();$('fBody').scrollIntoView({behavior:'smooth'});return false">показать список</a> ·
+      <a href="#" onclick="dl('/api/report.csv?status=deferred');return false">скачать список (CSV)</a> ·
+      <a href="#" onclick="post('/api/actions/previews');return false">сохранить превью для недоступных фото</a>
+    </div>
+  </div>
+
   <div class="card">
     <h2>Сейчас передаётся</h2>
     <div id="active" class="muted">Ничего</div>
@@ -149,6 +197,9 @@ a{color:var(--acc)}
   <div class="grid">
     <div class="card">
       <details id="stepYa" open><summary><h2 style="display:inline">1. Яндекс Диск <span id="yaBadge" class="badge"></span></h2></summary>
+      <label>Аккаунт Яндекса этого профиля</label>
+      <div class="row"><select id="yaAcc" style="flex:1" onchange="chooseAccount('yandex', this.value)"></select></div>
+      <div class="small muted" id="yaAccNote"></div>
       <label>OAuth-токен Яндекса</label>
       <input id="yandex_token" placeholder="y0_AgAAAA…" autocomplete="off">
       <details class="small" style="margin-top:8px"><summary>Как получить токен (3 минуты)</summary>
@@ -171,6 +222,9 @@ a{color:var(--acc)}
 
     <div class="card">
       <details id="stepG" open><summary><h2 style="display:inline">2. Google Drive <span id="gBadge" class="badge"></span></h2></summary>
+      <label>Аккаунт Google этого профиля</label>
+      <div class="row"><select id="gAcc" style="flex:1" onchange="chooseAccount('google', this.value)"></select></div>
+      <div class="small muted" id="gAccNote"></div>
       <label>Client ID (тип «Desktop app»)</label>
       <input id="google_client_id" placeholder="…apps.googleusercontent.com">
       <label>Client secret</label>
@@ -199,6 +253,7 @@ a{color:var(--acc)}
   <div class="card">
     <details id="stepPu" open><summary><h2 style="display:inline">3. Раздел «Фото» (автозагрузка с телефона) <span id="puBadge" class="badge"></span></h2></summary>
     <div class="small" id="puInfo" style="margin:8px 0"></div>
+    <div class="small muted" id="puAccNote" style="margin-bottom:6px"></div>
     <details class="small"><summary><b>Зачем куки и как их взять (2 минуты)</b></summary>
       <p>Фото из безлимитной автозагрузки видны только в разделе «Фото», а официальный API Яндекса их не отдаёт.
       Сайт Диска получает их плоским списком (с размером и MD5) и выдаёт ссылку на оригинал каждого файла —
@@ -260,6 +315,27 @@ a{color:var(--acc)}
       <button onclick="post('/api/scan/stop')">Остановить</button>
     </div>
     <div class="muted small" style="margin-top:6px">«Старт» можно нажимать сразу: файлы попадают в очередь по мере получения списка.</div>
+    <details id="importBox" style="margin-top:12px"><summary><b>Уже переносили прошлой версией программы? Перенести её карту файлов и аккаунты</b></summary>
+      <div class="small muted" style="margin:8px 0">Проще всего — положить новый YandexToGoogle.exe в ту же папку, где лежал старый:
+        его папка data подхватится сама, ничего делать не нужно. Если программа лежит в другой папке — укажите папку прошлой версии
+        (где лежал старый exe) или её папку data. Программа заберёт оттуда карту файлов — что перенесено, что отложено — и аккаунты Яндекса и Google:
+        входить заново и заново получать список с Яндекса не нужно. Прошлую версию перед этим лучше закрыть.</div>
+      <div class="row">
+        <input id="impPath" placeholder="Папка прошлой версии, например D:\YandexToGoogle" style="flex:1;min-width:220px">
+        <button onclick="impPick()">Обзор…</button>
+        <button onclick="impInspect()">Проверить</button>
+      </div>
+      <div class="small" style="margin-top:6px">или файл карты (.sqlite3 — экспорт этой программы или state.sqlite3 прошлой версии):
+        <input type="file" id="impFile" accept=".sqlite3,.db" onchange="impUpload()" style="width:auto"></div>
+      <div class="res" id="impRes"></div>
+      <div id="impActions" style="display:none">
+        <div class="chk"><input type="checkbox" id="impAcc" checked><span>Забрать и аккаунты: токен и куки Яндекса, вход в Google, раскладку папок на Drive</span></div>
+        <div class="row"><button class="primary" id="impBtn" onclick="impApply('auto')">Перенести</button>
+          <button id="impNew" onclick="impApply('new')">В новый профиль</button></div>
+      </div>
+      <div class="row" style="margin-top:10px"><button onclick="dl('/api/export/map')">⬇ Сохранить карту файлов этого профиля (.sqlite3)</button>
+        <span class="small muted">Можно открыть в этой программе на другом компьютере. Токенов и куки в карте нет.</span></div>
+    </details>
   </div>
 
   <div class="card" id="probeCard">
@@ -332,12 +408,12 @@ a{color:var(--acc)}
       <div class="kv" id="taskBox"></div>
       <div style="display:grid;gap:8px;margin-top:10px">
         <div class="small muted">Файлы, которые Яндекс не отдал, сразу уходят в «Отложенные» и сами не повторяются — чтобы не тормозить остальное.</div>
-        <button onclick="post('/api/actions/retry_errors')">↻ Повторить отложенные и ошибки (ещё один проход)</button>
-        <a href="/api/report.csv?status=deferred"><button style="width:100%">⬇ Список отложенных (CSV для Excel)</button></a>
+        <button onclick="retryDeferred()">↻ Повторить отложенные и ошибки (ещё один проход)</button>
+        <button onclick="dl('/api/report.csv?status=deferred')">⬇ Список отложенных (CSV для Excel)</button>
         <button onclick="post('/api/actions/previews')">🖼 Сохранить превью для всех фото, которые Яндекс сейчас не отдаёт</button>
         <div class="small muted">Сверка находит удалённые на Drive и несовпавшие файлы и ставит их в очередь:</div>
         <button onclick="post('/api/actions/verify_drive')">🔎 Полная сверка с Google Drive (размер и MD5 каждого файла)</button>
-        <a href="/api/report.csv"><button style="width:100%">⬇ Отчёт по всем файлам (CSV для Excel)</button></a>
+        <button onclick="dl('/api/report.csv')">⬇ Отчёт по всем файлам (CSV для Excel)</button>
         <div class="small muted">Полностью начать перенос заново (список файлов сохранится):</div>
         <button class="danger" onclick="if(confirm('Поставить ВСЕ файлы в очередь заново? Уже лежащие на Drive одинаковые файлы будут пропущены.'))post('/api/actions/requeue_all')">⟲ Начать перенос заново</button>
         <button class="danger" onclick="if(confirm('Удалить всю базу (список файлов и прогресс)? Файлы на Drive не трогаются.'))post('/api/actions/reset_db')">🗑 Очистить базу полностью</button>
@@ -408,7 +484,12 @@ function fmtS(bps){ return bps ? `${fmtB(bps)}/с (${(bps*8/1e6).toFixed(bps*8/1
 function ms(sec){ return sec==null ? '—' : (sec<1 ? Math.round(sec*1000)+' мс' : sec.toFixed(1)+' с'); }
 function kv(rows){ return rows.map(([k,v])=>`<span class="k">${k}</span><span>${v}</span>`).join(''); }
 
+let PROFILE = 'main', profilesData = null;
+try{ PROFILE = localStorage.getItem('ya2gd.profile') || 'main'; }catch(e){}
+function withProfile(url){ return url + (url.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(PROFILE); }
+function dl(url){ location.href = withProfile(url); }
 async function api(url, opts={}){
+  opts.headers = Object.assign({'X-Ya2gd-Profile': PROFILE}, opts.headers||{});
   const r = await fetch(url, opts);
   const j = await r.json().catch(()=>({error:'Некорректный ответ'}));
   if(!r.ok) throw new Error(j.error||('HTTP '+r.status));
@@ -435,7 +516,9 @@ async function loadSettings(){
   $('gBadge').className = 'badge ' + (settings.google_refresh_token_set ? 'b-ok' : 'b-warn');
   $('bufBadge').textContent = settings.buffer_dir ? 'включён' : 'без буфера';
   $('bufBadge').className = 'badge ' + (settings.buffer_dir ? 'b-ok' : '');
-  if(settings.yandex_token_set) $('stepYa').classList.add('step-done');
+  if(settings.yandex_token_set) $('stepYa').classList.add('step-done'); else $('stepYa').classList.remove('step-done');
+  if(!settings.google_refresh_token_set) $('stepG').classList.remove('step-done');
+  loadProfiles();
   $('terms').innerHTML = settings.terms_accepted ? '' : `<div class="card" style="border-color:var(--acc)">
     <h2>Перед началом</h2>
     <div class="small">Это бесплатная программа с открытым исходным кодом (<a href="/legal/license-ru" target="_blank">лицензия MIT</a>).
@@ -487,7 +570,8 @@ async function saveYandex(){
 function yaToken(){
   const id = $('yandex_client_id').value.trim(); if(!id){alert('Введите ClientID');return;}
   post('/api/settings',{yandex_client_id:id});
-  window.open('https://oauth.yandex.ru/authorize?response_type=token&client_id='+encodeURIComponent(id),'_blank');
+  // force_confirm — Яндекс спросит, под каким аккаунтом войти (важно, когда аккаунтов несколько)
+  window.open('https://oauth.yandex.ru/authorize?response_type=token&force_confirm=yes&client_id='+encodeURIComponent(id),'_blank');
 }
 async function saveCookies(){
   $('puRes').textContent='Проверяю…';
@@ -500,7 +584,7 @@ async function saveCookies(){
 }
 async function googleLogin(){
   await post('/api/settings', collect(['google_client_id','google_client_secret']));
-  location.href='/oauth/google/start';
+  location.href=withProfile('/oauth/google/start');
 }
 async function testGoogle(){
   $('gRes').textContent='Проверяю…';
@@ -597,6 +681,9 @@ async function refresh(){
     done:['Завершено','b-ok'],attention:['Нужно ваше внимание','b-err']};
   let [txt,cls] = map[t.state]||[t.state,''];
   if(t.state==='done' && sum('deferred').count){ txt=`Проход завершён · отложено ${nf(sum('deferred').count)}`; cls='b-warn'; }
+  const myQ = s.profiles.find(p=>p.id===PROFILE);
+  if(t.state!=='running' && myQ && myQ.waiting){ txt='Ждёт: переносит другой профиль'; cls='b-warn'; }
+  if(s.queue.active && t.state!=='running'){ const cur = s.profiles.find(p=>p.id===s.queue.current); if(cur && cur.id!==PROFILE){ txt=`Очередь: сейчас «${cur.name}»`; cls='b-acc'; } }
   if(t.state==='running' && t.offline_since){ txt='Нет интернета — жду'; cls='b-err'; }
   else if(t.state==='running' && !s.active.length && t.next_wakeup){ txt='Жду: Яндекс пока не отдаёт часть файлов, повтор в '+hhmm(t.next_wakeup); cls='b-warn'; }
   const tk0 = s.task;
@@ -674,6 +761,12 @@ async function refresh(){
     (sc.error?` · <span style="color:var(--err)">ошибка: ${esc(sc.error)}</span>`:'');
   $('btnScan').disabled = sc.running;
   renderProbe(s);
+  renderDeferred(s);
+  if(!s.profiles.some(p=>p.id===PROFILE)){ switchProfile('main'); return; }
+  const sel = $('profileSel');
+  if(document.activeElement !== sel)
+    sel.innerHTML = s.profiles.map(p=>`<option value="${esc(p.id)}"${p.id===PROFILE?' selected':''}>${esc(p.name)}${p.running?' — идёт перенос':(p.waiting?' — ждёт':'')}</option>`).join('');
+  if($('profilesBox').open && (!window._profAt || Date.now()-window._profAt > 4000)){ window._profAt = Date.now(); loadProfiles(); }
   const tk = s.task;
   $('taskBox').innerHTML = tk.name ? kv([['Операция', `${esc(tk.name)} — ${tk.state==='running'?'выполняется…':(tk.state==='error'?'ошибка':'готово')}`],
     ['Итог', esc(tk.msg)]]) : '';
@@ -741,7 +834,7 @@ function renderProbe(s){
     $('prLabels').innerHTML = '<h3>Разметка неперенесённых файлов</h3>' + line('photos','«Фото»') + line('files','«Файлы»') +
       `<div class="row" style="margin-top:8px">` +
       (pr.deferrable ? `<button onclick="if(confirm('Отложить ${pr.deferrable} файлов, которые Яндекс при разметке не отдал? Перенос не будет тратить на них время; повторить их можно кнопкой «Повторить отложенные и ошибки».'))post('/api/probe/defer')">⏭ Отложить недоступные по разметке (${pr.deferrable})</button>` : '') +
-      `<a href="/api/report.csv?status=probe_dead"><button>⬇ Не отдаются по разметке (CSV)</button></a></div>` +
+      `<button onclick="dl('/api/report.csv?status=probe_dead')">⬇ Не отдаются по разметке (CSV)</button></div>` +
       '<div class="small muted" style="margin-top:4px">Файлы, которые не отдаются, перенос и так берёт последними.</div>';
   } else $('prLabels').innerHTML = '';
 
@@ -760,6 +853,235 @@ function renderProbe(s){
         `<td>${f.link_s!=null ? ms(f.link_s+f.ttfb_s) : (f.fail_s!=null ? 'отказ за '+ms(f.fail_s) : '—')}</td>` +
         `<td>${f.read_s && f.bytes >= 65536 ? fmtB(f.bytes/f.read_s)+'/с' : '—'}${f.bytes ? `<div class="small muted">прочитано ${fmtB(f.bytes)}</div>` : ''}</td><td class="small">${esc(f.note||'')}</td></tr>`; }).join('') +
     '</tbody></table>' : '';
+}
+
+// ---------------------------------------------------------------- профили и аккаунты
+const PSTATE = {idle:'ожидание', running:'идёт перенос', pausing:'останавливается', paused:'пауза', done:'проход завершён',
+  attention:'нужно внимание', scanning:'получает список'};
+function yaUrl(path){
+  // ссылка на файл в веб-версии Диска: открывается в просмотрщике прямо на этом файле
+  const m = /^(disk|photounlim):\/?(.*)$/.exec(path||'');
+  if(!m) return 'https://disk.yandex.ru/client/disk';
+  const rel = m[2];
+  if(m[1]==='photounlim') return 'https://disk.yandex.ru/client/photo?idApp=client&dialog=slider&idDialog='+encodeURIComponent('/photounlim/'+rel);
+  const dir = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+  return 'https://disk.yandex.ru/client/disk' + (dir ? '/'+dir.split('/').map(encodeURIComponent).join('/') : '') +
+    '?idApp=client&dialog=slider&idDialog=' + encodeURIComponent('/disk/'+rel);
+}
+function switchProfile(pid){
+  if(pid===PROFILE) return;
+  PROFILE = pid; try{ localStorage.setItem('ya2gd.profile', pid); }catch(e){}
+  logSeq = 0; $('log').innerHTML = ''; page = 0; $('impRes').textContent = ''; $('impActions').style.display = 'none';
+  loadSettings(); refresh(); loadFiles();
+}
+function openProfiles(){ $('profilesBox').open = true; loadProfiles(); $('profilesCard').scrollIntoView({behavior:'smooth'}); }
+async function startTransfer(){
+  const r = await post('/api/transfer/start');
+  if(r && r.queued) alert(`Сейчас переносит профиль «${r.after}». Этот профиль начнётся сам сразу после него.`);
+}
+async function loadProfiles(){
+  try{ profilesData = await api('/api/profiles'); }catch(e){ return; }
+  renderProfiles(); renderAccountSelects();
+}
+function accOptions(kind, cur, withNew){
+  const list = (profilesData && profilesData.accounts[kind]) || [];
+  let h = list.map(a=>`<option value="${esc(a.id)}"${a.id===cur?' selected':''}>${esc(a.label)}${kind==='google'&&a.email&&a.email!==a.label?' ('+esc(a.email)+')':''}</option>`).join('');
+  if(!cur) h = `<option value="" selected>— не выбран —</option>` + h;
+  if(withNew) h += `<option value="__new">${kind==='yandex'?'＋ новый аккаунт Яндекса':'＋ новый вход в Google (тот же проект Google Cloud)'}</option>`;
+  return h;
+}
+function renderAccountSelects(){
+  if(!profilesData) return;
+  $('yaAcc').innerHTML = accOptions('yandex', settings.yandex_account, true);
+  $('gAcc').innerHTML = accOptions('google', settings.google_account, true);
+  const used = (kind, id) => { const a = (profilesData.accounts[kind]||[]).find(x=>x.id===id); return a ? a.used.filter(n=>n!==curName()) : []; };
+  const note = (kind, id) => { const u = used(kind, id); return u.length ? 'Этот же аккаунт выбран и в профилях: ' + u.map(x=>'«'+esc(x)+'»').join(', ') + '. Изменения ключей видны везде.' : ''; };
+  $('yaAccNote').innerHTML = note('yandex', settings.yandex_account);
+  $('gAccNote').innerHTML = note('google', settings.google_account);
+  $('puAccNote').innerHTML = settings.yandex_account ? `Куки сохраняются в аккаунт Яндекса «${esc(settings.yandex_account_label||'')}» (блок 1) — берите их из браузера, где вы вошли именно в этот аккаунт.` : '';
+  $('npYa').innerHTML = accOptions('yandex', '', true).replace('— не выбран —', '— выбрать позже —');
+  $('npG').innerHTML = accOptions('google', '', true).replace('— не выбран —', '— выбрать позже —');
+}
+function curName(){ const p = (profilesData && profilesData.profiles.find(x=>x.id===PROFILE)); return p ? p.name : ''; }
+async function chooseAccount(kind, val){
+  const total = lastStatus ? Object.values(lastStatus.stats.by_status).reduce((a,b)=>a+b.count,0) : 0;
+  if(total && !confirm(kind==='yandex'
+      ? 'В этом профиле уже есть список файлов прежнего аккаунта Яндекса. Для другого аккаунта лучше создать отдельный профиль («Профили…»). Всё равно сменить аккаунт здесь?'
+      : 'Сменить аккаунт Google в профиле, где уже есть перенесённые файлы? Они лежат на Drive прежнего аккаунта. После смены сделайте «Полную сверку с Google Drive» — пропавшие файлы встанут в очередь.')){
+    renderAccountSelects(); return;
+  }
+  try{
+    if(val==='__new') await post('/api/accounts/create', {kind}, true);
+    else await post('/api/profile/accounts', {[kind+'_account']: val}, true);
+  }catch(e){ alert(e.message); }
+  await loadSettings();
+}
+function renderProfiles(){
+  const d = profilesData; if(!d) return;
+  const q = d.queue;
+  $('profBadge').textContent = `${d.profiles.length} ${plural(d.profiles.length,'профиль','профиля','профилей')}` + (q.active ? ' · идёт очередь' : '');
+  $('profBadge').className = 'badge ' + (q.active ? 'b-acc' : '');
+  $('profBody').innerHTML = d.profiles.map((p,i)=>{
+    const pc = pct(p.done_bytes, p.bytes);
+    let st = PSTATE[p.state] || p.state;
+    if(p.waiting) st = 'ждёт очереди';
+    if(q.active && q.current===p.id) st += ' (очередь)';
+    else if(q.pending.includes(p.id)) st = 'в очереди, №' + (q.pending.indexOf(p.id)+1);
+    return `<tr${p.id===PROFILE?' style="background:var(--chip)"':''}>
+      <td><input type="checkbox" ${p.queue?'checked':''} onchange="profAct('queue_flag',{id:'${p.id}',on:this.checked})"></td>
+      <td><b>${esc(p.name)}</b>${p.id===PROFILE?' <span class="badge b-acc">открыт</span>':''}</td>
+      <td class="small">${esc(p.yandex||'— нет аккаунта —')} → ${esc(p.google||'— нет аккаунта —')}</td>
+      <td class="small">${p.files ? `${p.done.toLocaleString('ru')} из ${nf(p.files)}<div class="bar" style="margin-top:3px"><div class="ok" style="width:${pc.toFixed(1)}%"></div></div>` : (p.scan==='done'?'пусто':'список не получен')}</td>
+      <td class="small">${p.deferred ? nf(p.deferred) : '—'}${p.deferred_auto!=='off'?`<div class="muted">повтор ${({day:'раз в день',week:'раз в неделю',month:'раз в месяц'})[p.deferred_auto]}</div>`:''}</td>
+      <td class="small">${esc(st)}</td>
+      <td style="white-space:nowrap">${p.id!==PROFILE?`<button onclick="switchProfile('${p.id}')">Открыть</button>`:''}
+        <button title="Выше" onclick="profAct('move',{id:'${p.id}',delta:-1})" ${i===0?'disabled':''}>↑</button>
+        <button title="Ниже" onclick="profAct('move',{id:'${p.id}',delta:1})" ${i===d.profiles.length-1?'disabled':''}>↓</button>
+        <button title="Переименовать" onclick="renameProfile('${p.id}', ${JSON.stringify(esc(p.name))})">✎</button>
+        ${p.id!=='main'?`<button class="danger" title="Удалить профиль" onclick="deleteProfile('${p.id}', ${JSON.stringify(esc(p.name))})">🗑</button>`:''}</td></tr>`;
+  }).join('');
+  const nm = id => '«' + esc((d.profiles.find(x=>x.id===id)||{name:id}).name) + '»';
+  let qh;
+  if(q.active) qh = `<span class="small">Очередь: сейчас ${q.current?nm(q.current):'—'}${q.pending.length?', дальше: '+q.pending.map(nm).join(', '):''}</span>
+      <button onclick="post('/api/queue/stop').then(loadProfiles)">⏹ Остановить очередь</button>`;
+  else if(q.current) qh = `<button class="primary" onclick="post('/api/queue/start').then(loadProfiles)">▶ Продолжить очередь</button>
+      <span class="small muted">остановлена на ${nm(q.current)}</span>
+      <button onclick="post('/api/queue/stop').then(loadProfiles)">Сбросить</button>`;
+  else qh = `<button class="primary" onclick="post('/api/queue/start').then(loadProfiles)">▶ Перенести отмеченные по очереди</button>
+      <span class="small muted">профили переносятся друг за другом, в порядке таблицы; без списка файлов — сначала получают список</span>`;
+  $('queueBox').innerHTML = qh;
+  const acc = (kind) => (d.accounts[kind]||[]).map(a=>`<div class="row" style="gap:6px;margin:4px 0"><span><b>${esc(a.label)}</b>
+      <span class="muted">${kind==='yandex' ? `${a.token?'токен ✓':'нет токена'} · ${a.cookies?'куки ✓':'нет куки'}` : `${a.signed_in?'вход ✓':'нет входа'}${a.email&&a.email!==a.label?' · '+esc(a.email):''}`}
+      · ${a.used.length ? 'в профилях: '+a.used.map(x=>'«'+esc(x)+'»').join(', ') : 'не используется'}</span></span>
+      <button title="Переименовать" onclick="renameAccount('${kind}','${a.id}', ${JSON.stringify(esc(a.label))})">✎</button>
+      ${a.used.length?'':`<button class="danger" title="Удалить из библиотеки" onclick="deleteAccount('${kind}','${a.id}', ${JSON.stringify(esc(a.label))})">🗑</button>`}</div>`).join('') || '<span class="muted">пока нет</span>';
+  $('accYa').innerHTML = acc('yandex'); $('accG').innerHTML = acc('google');
+}
+async function profAct(what, body){ try{ await post('/api/profiles/'+what, body, true); }catch(e){ alert(e.message); } loadProfiles(); }
+function renameProfile(id, name){ const n = prompt('Новое название профиля', name.replace(/&quot;/g,'"').replace(/&amp;/g,'&')); if(n) profAct('rename', {id, name:n}); }
+function deleteProfile(id, name){
+  if(!confirm(`Удалить профиль ${name}? Удалятся его список файлов, прогресс и журнал на этом компьютере. Файлы на Яндекс Диске и Google Drive и аккаунты в библиотеке не тронутся.`)) return;
+  if(id===PROFILE) switchProfile('main');
+  profAct('delete', {id});
+}
+async function renameAccount(kind, id, label){ const n = prompt('Название аккаунта', label.replace(/&quot;/g,'"').replace(/&amp;/g,'&')); if(n){ await post('/api/accounts/rename',{kind,id,label:n}).catch(()=>{}); loadProfiles(); loadSettings(); } }
+async function deleteAccount(kind, id, label){ if(confirm(`Удалить аккаунт ${label} из библиотеки? Его токен и куки будут стёрты с этого компьютера.`)){ await post('/api/accounts/delete',{kind,id}).catch(()=>{}); loadProfiles(); } }
+async function createProfile(){
+  const ya = $('npYa').value, g = $('npG').value;
+  const firstClient = ((profilesData && profilesData.accounts.google) || []).find(a=>a.client);
+  try{
+    const r = await post('/api/profiles/create', {name: $('npName').value, yandex_account: ya==='__new'?'':ya, google_account: g==='__new'?'':g}, true);
+    $('npName').value = '';
+    switchProfile(r.id);
+    if(ya==='__new') await post('/api/accounts/create', {kind:'yandex'}, true);
+    if(g==='__new') await post('/api/accounts/create', {kind:'google', client_from: firstClient ? firstClient.id : ''}, true);
+    await loadSettings();
+    $('stepYa').open = true; $('stepG').open = true; $('stepPu').open = true;
+    $('stepYa').scrollIntoView({behavior:'smooth'});
+  }catch(e){ alert(e.message); }
+}
+
+// ---------------------------------------------------------------- отложенные: повтор и расписание
+async function retryDeferred(){
+  const d = lastStatus && lastStatus.deferred;
+  const n = d ? d.count : 0, er = d ? d.errors : 0;
+  if(!n && !er){ alert('Отложенных файлов и ошибок нет — повторять нечего.'); return; }
+  if(!confirm(`Повторить ${n ? nf(n)+' из «Отложенных»' : ''}${n&&er?' и ':''}${er ? er+' с ошибками' : ''}?\n\nОни снова встанут в очередь, и перенос запустится сам. Что отдастся — перенесётся, остальное вернётся в «Отложенные». Ход повтора будет виден в этом блоке.`)) return;
+  try{
+    const r = await post('/api/deferred/retry', {}, true);
+    if(r.queued) alert(`Файлы возвращены в очередь. Сейчас переносит профиль «${r.after}» — этот профиль начнётся сразу после него.`);
+  }catch(e){ alert(e.message); }
+}
+async function saveAuto(){
+  try{ await post('/api/settings', {deferred_auto: $('deferred_auto').value}, true); settings.deferred_auto = $('deferred_auto').value; }
+  catch(e){ alert(e.message); }
+}
+function dt(ts){ return new Date(ts*1000).toLocaleString('ru',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }
+function renderDeferred(s){
+  const d = s.deferred, r = d.retry, running = s.transfer.state==='running';
+  $('defBadge').textContent = d.count ? nf(d.count) : 'нет';
+  $('defBadge').className = 'badge ' + (d.count ? 'b-warn' : 'b-ok');
+  let h = d.count
+    ? `<b>${nf(d.count)} (${fmtB(d.bytes)})</b> Яндекс пока не отдал. Они не потеряны: программа их не трогает, пока вы не нажмёте «Повторить» или не настанет время повтора по расписанию.`
+    : 'Отложенных файлов нет.';
+  if(d.errors) h += ` Ещё ${nf(d.errors)} с ошибками — «Повторить» берёт и их.`;
+  if(r && r.total){
+    const proc = r.done + r.deferred + r.errors;
+    h += `<div style="margin-top:10px"><b>${r.finished ? 'Последний повтор' : 'Идёт повтор'}</b> от ${dt(r.at)}${r.auto?' (по расписанию)':''}:
+      ${r.finished ? 'готово' : `проверено ${proc.toLocaleString('ru')} из ${nf(r.total)}`}</div>
+      <div class="bar" style="margin-top:4px"><div class="ok" style="width:${pct(r.done,r.total).toFixed(1)}%"></div><div class="ya" style="width:${pct(r.deferred+r.errors,r.total).toFixed(1)}%"></div></div>
+      <div class="muted" style="margin-top:4px">✅ перенесено ${r.done.toLocaleString('ru')}${r.done_bytes?' ('+fmtB(r.done_bytes)+')':''} ·
+        ⏳ снова не отдались ${r.deferred.toLocaleString('ru')}${r.errors?' · ❌ ошибок '+r.errors:''}${r.left?' · ещё в работе '+r.left.toLocaleString('ru'):''}</div>`;
+    if(r.finished) h += `<div class="muted">${r.done ? 'Перенесённые — уже на Google Drive.' : 'Пока Яндекс не отдал ни одного из них.'}${r.deferred ? ' Не отдавшиеся остались в «Отложенных» — их можно повторить позже.' : ''}</div>`;
+    else if(!running && r.left) h += `<div class="muted">Перенос сейчас не идёт — нажмите «▶ Старт», чтобы повтор продолжился.</div>`;
+  }
+  $('defBody').innerHTML = h;
+  $('btnRetry').disabled = !(d.count || d.errors);
+  $('btnRetry').textContent = '↻ Повторить отложенные сейчас' + (d.count ? ` (${d.count.toLocaleString('ru')})` : '');
+  if(document.activeElement !== $('deferred_auto')) $('deferred_auto').value = d.auto;
+  $('defNext').textContent = d.next_auto ? `следующий автоматический повтор: ${dt(d.next_auto)}${d.next_auto < Date.now()/1000 ? ' (как только освободится перенос)' : ''}`
+    : (d.last_retry ? `последний повтор: ${dt(d.last_retry)}` : '');
+}
+
+// ---------------------------------------------------------------- перенос из прошлой версии
+let impPathValue = '';
+async function impPick(){
+  try{
+    $('impRes').textContent = 'Открываю окно выбора папки (оно может оказаться за этим окном)…';
+    const r = await post('/api/pick_folder', {initial: $('impPath').value, title: 'Папка прошлой версии программы (где лежал YandexToGoogle.exe)'}, true);
+    $('impRes').textContent = '';
+    if(r.path){ $('impPath').value = r.path; impInspect(); }
+  }catch(e){ $('impRes').textContent = '❌ ' + e.message; }
+}
+function impShow(r){
+  impPathValue = r.db;
+  const b = r.by_status, n = k => (b[k]||{count:0}).count;
+  let t = `✅ Найдена карта файлов: ${nf(r.files)} (${fmtB(r.bytes)})\n` +
+    `   перенесено: ${n('done').toLocaleString('ru')} · отложено: ${n('deferred').toLocaleString('ru')} · ошибок: ${n('error').toLocaleString('ru')} · ждут переноса: ${(n('pending')+n('active')+n('buffered')+n('uploading')).toLocaleString('ru')}` +
+    (n('pending') && r.files > n('done') ? '' : '') + '\n';
+  if(r.settings) t += `   аккаунты: Яндекс — ${r.yandex_token?'токен ✓':'нет токена'}, ${r.yandex_cookies?'куки ✓':'нет куки'}; Google — ${r.google_signed_in?'вход ✓ '+(r.google_email||''):'нет входа'}\n`;
+  else t += '   настроек прошлой версии рядом нет — аккаунты нужно будет выбрать или ввести\n';
+  if(r.scan==='done') t += '   список с Яндекса был получен полностью — заново получать не нужно\n';
+  $('impRes').textContent = t;
+  const empty = lastStatus && !Object.values(lastStatus.stats.by_status).reduce((a,x)=>a+x.count,0);
+  $('impBtn').textContent = empty ? 'Перенести в этот профиль' : 'Перенести в новый профиль';
+  $('impNew').style.display = empty ? '' : 'none';
+  $('impActions').style.display = '';
+}
+async function impInspect(){
+  $('impActions').style.display = 'none';
+  if(!$('impPath').value.trim()){ $('impRes').textContent = 'Укажите папку прошлой версии.'; return; }
+  $('impRes').textContent = 'Проверяю…';
+  try{ impShow(await post('/api/import/inspect', {path: $('impPath').value}, true)); }
+  catch(e){ $('impRes').textContent = '❌ ' + e.message; }
+}
+async function impUpload(){
+  const f = $('impFile').files[0]; if(!f) return;
+  $('impActions').style.display = 'none';
+  $('impRes').textContent = `Загружаю ${f.name} (${fmtB(f.size)})…`;
+  try{
+    const r = await api('/api/import/upload', {method:'POST', headers:{'X-Ya2gd':'1','Content-Type':'application/octet-stream'}, body: f});
+    impShow(r);
+  }catch(e){ $('impRes').textContent = '❌ ' + e.message; }
+  $('impFile').value = '';
+}
+async function impApply(target){
+  $('impRes').textContent = 'Переношу карту файлов…';
+  try{
+    const r = await post('/api/import/apply', {path: impPathValue, target, with_accounts: $('impAcc').checked}, true);
+    const b = r.by_status, n = k => (b[k]||0);
+    let t = `✅ Готово: в профиль «${r.profile_name}» добавлено ${nf(r.added)}` + (r.total>r.added ? ` (ещё ${r.total-r.added} там уже были)` : '') +
+      `.\n   Из них перенесено раньше: ${n('done').toLocaleString('ru')}, отложено: ${n('deferred').toLocaleString('ru')}, ждут переноса: ${n('pending').toLocaleString('ru')}.\n` +
+      (r.accounts.length ? '   Аккаунты прошлой версии добавлены в библиотеку и выбраны в профиле.\n' : '') +
+      '   Список с Яндекса заново получать не нужно: нажмите «Повторить отложенные» или «▶ Старт».';
+    if(n('done') && r.source_google && r.target_google && !r.same_google)
+      t += `\n⚠ Перенесённые раньше файлы лежат на Drive аккаунта ${r.source_google}, а этот профиль переносит в ${r.target_google}. ` +
+           'Нажмите «Полная сверка с Google Drive» — файлы, которых нет на этом Drive, встанут в очередь.';
+    $('impActions').style.display = 'none';
+    if(r.profile !== PROFILE) switchProfile(r.profile);
+    $('impRes').textContent = t;
+    loadProfiles();
+  }catch(e){ $('impRes').textContent = '❌ ' + e.message; }
 }
 
 async function loadLog(){
@@ -790,7 +1112,7 @@ async function loadFiles(){
     ${(waiting||(f.status==='error'&&settings.auto_retry_hours>0))&&f.next_try<4e9?`<div class="small muted">повтор в ${hhmm(f.next_try)}</div>`:''}
     ${(f.status==='pending'||f.status==='uploading'||f.status==='buffered')&&f.bytes_done?`<div class="small muted">в Google ${fmtB(f.bytes_done)}</div>`:''}</td>
     <td class="small">${esc(f.note||'')} <span style="color:var(--err)">${esc(f.status==='done'?'':(f.last_error||''))}</span>
-    ${f.gd_id?`<div><a target="_blank" href="https://drive.google.com/file/d/${esc(f.gd_id)}/view">открыть на Drive</a></div>`:''}
+    <div>открыть: <a target="_blank" href="${yaUrl(f.path)}" title="Откроется в браузере под тем аккаунтом Яндекса, под которым вы там вошли">на Яндекс Диске</a>${f.gd_id?` · <a target="_blank" href="https://drive.google.com/file/d/${esc(f.gd_id)}/view">на Google Drive</a>`:''}</div>
     ${f.preview_id?`<div><a target="_blank" href="https://drive.google.com/file/d/${esc(f.preview_id)}/view">превью на Drive</a></div>`:''}</td>
     <td style="white-space:nowrap">${f.status==='error'||f.status==='skipped'||f.status==='deferred'||waiting?`<button title="Повторить сейчас" onclick="fa(${f.id},'retry')">↻</button>`:''}
     ${f.status==='pending'||f.status==='error'||f.status==='buffered'||f.status==='deferred'?`<button title="Пропустить" onclick="fa(${f.id},'skip')">⏭</button>`:''}

@@ -154,7 +154,7 @@ def list_drives():
     return out
 
 
-def pick_folder(initial=""):
+def pick_folder(initial="", title="Папка для буфера (лучше на быстром диске с местом)"):
     """Стандартный диалог Windows «Выбор папки». Возвращает путь или '' (отмена)."""
     result = {"path": ""}
 
@@ -166,7 +166,7 @@ def pick_folder(initial=""):
             root.withdraw()
             root.attributes("-topmost", True)
             result["path"] = filedialog.askdirectory(parent=root, initialdir=initial or None,
-                                                     title="Папка для буфера (лучше на быстром диске с местом)",
+                                                     title=title,
                                                      mustexist=False) or ""
             root.destroy()
         except Exception as e:  # noqa
@@ -177,7 +177,7 @@ def pick_folder(initial=""):
     if result.get("error") and WIN:
         ps = ("Add-Type -AssemblyName System.Windows.Forms;"
               "$f=New-Object System.Windows.Forms.FolderBrowserDialog;"
-              "$f.Description='Папка для буфера';"
+              "$f.Description='" + title.replace("'", "") + "';"
               "if($f.ShowDialog() -eq 'OK'){[Console]::OutputEncoding=[Text.Encoding]::UTF8;$f.SelectedPath}")
         try:
             out = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps], capture_output=True,

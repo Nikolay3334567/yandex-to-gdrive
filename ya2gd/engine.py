@@ -31,9 +31,10 @@ import shutil
 import threading
 import time
 import traceback
+import urllib.parse
 
 from . import winsys
-from .core import Log, Settings, data_dir
+from .core import DEFERRED_AUTO, Log, Settings, data_dir
 from .db import DB, FOREVER
 from .fetch import DEAD, Overloaded, SpeedGuard, StorageDown, open_download
 from .gdrive import API as GOOGLE_API, APP_PROP, DriveClient, GoogleAuth
@@ -184,6 +185,19 @@ def drive_dir_for(row, s):
     return f"{base}/{sub}" if sub else base
 
 
+def yandex_web_url(path):
+    """Ссылка на файл в веб-версии Яндекс Диска: открывается в просмотрщике прямо на этом файле
+    (под тем аккаунтом Яндекса, под которым вошли в браузере)."""
+    src, _, rel = (path or "").partition(":")
+    rel = rel.lstrip("/")
+    if src == "photounlim":
+        return "https://disk.yandex.ru/client/photo?idApp=client&dialog=slider&idDialog=" + \
+            urllib.parse.quote("/photounlim/" + rel, safe="")
+    folder = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    return "https://disk.yandex.ru/client/disk" + ("/" + urllib.parse.quote(folder) if folder else "") + \
+        "?idApp=client&dialog=slider&idDialog=" + urllib.parse.quote("/disk/" + rel, safe="")
+
+
 def is_network(e):
     return isinstance(e, NETWORK_ERRORS) or (isinstance(e, ApiError) and e.retryable and e.status is None)
 
@@ -279,11 +293,13 @@ class MemQueue:
 
 
 class Buffer:
-    """Папка буфера на диске компьютера. Файлы программы лежат в подпапке ya2gd-buffer."""
+    """Папка буфера на диске компьютера. Файлы программы лежат в подпапке ya2gd-buffer
+    (у дополнительных профилей — ya2gd-buffer-<профиль>: при запуске программа чистит из своей подпапки
+    всё, чего нет в её базе, и чужие файлы не должны туда попадать)."""
 
-    def __init__(self, base):
+    def __init__(self, base, sub="ya2gd-buffer"):
         self.base = os.path.abspath(base)
-        self.dir = os.path.join(self.base, "ya2gd-buffer")
+        self.dir = os.path.join(self.base, sub)
 
     def prepare(self):
         try:
@@ -352,10 +368,12 @@ def _remove(path):
 
 
 class Engine:
-    def __init__(self, ddir=None):
+    def __init__(self, ddir=None, accounts=None, shared=None, profile_id="", prefix=""):
         self.dir = ddir or data_dir()
-        self.settings = Settings(os.path.join(self.dir, "settings.json"))
-        self.log = Log(os.path.join(self.dir, "ya2gd.log"))
+        self.profile_id = profile_id
+        self.buffer_sub = "ya2gd-buffer" if profile_id in ("", "main") else f"ya2gd-buffer-{profile_id}"
+        self.settings = Settings(os.path.join(self.dir, "settings.json"), accounts=accounts, shared=shared)
+        self.log = Log(os.path.join(self.dir, "ya2gd.log"), prefix=prefix)
         self.db = DB(os.path.join(self.dir, "state.sqlite3"))
         if self.settings.migrated:
             self.log("Настройки прежней версии перенесены: папки на Drive остаются прежними")
@@ -757,7 +775,7 @@ class Engine:
                     self.log("Буфер на диске выключен: дальше маленькие файлы ждут в памяти, большие идут напрямую")
                 self.buffer = None
                 return
-            b = Buffer(s["buffer_dir"])
+            b = Buffer(s["buffer_dir"], self.buffer_sub)
             if self.buffer and self.buffer.base == b.base:
                 return
             b.prepare()
@@ -2173,7 +2191,7 @@ class Engine:
         wr = csv.writer(out, delimiter=";")
         wr.writerow(["Путь на Яндексе", "Раздел", "Размер, байт", "MD5 Яндекса", "Статус", "Проверено (MD5 совпал)",
                      "Папка на Google Drive", "Ссылка", "Превью вместо оригинала", "Ошибка/примечание",
-                     "Разметка", "Задержка Яндекса, мс", "Примечание разметки"])
+                     "Разметка", "Задержка Яндекса, мс", "Примечание разметки", "Ссылка на Яндекс Диске"])
         st_names = {"pending": "в очереди", "active": "в работе", "buffered": "в буфере", "uploading": "в работе",
                     "done": "готово", "error": "ошибка", "skipped": "пропущен", "deferred": "отложен"}
         probe_names = {"ok": "отдаётся", "slow": "отдаёт по капле", "dead": "не отдаётся", "missing": "нет на Яндексе"}
@@ -2193,18 +2211,27 @@ class Engine:
                          f"https://drive.google.com/file/d/{r['gd_id']}/view" if r["gd_id"] else "",
                          f"https://drive.google.com/file/d/{r['preview_id']}/view" if r["preview_id"] else "",
                          r["last_error"] or r["note"] or "",
-                         probe_names.get(r["probe"], ""), r["probe_ms"] or "", r["probe_note"] or ""])
+                         probe_names.get(r["probe"], ""), r["probe_ms"] or "", r["probe_note"] or "",
+                         yandex_web_url(r["path"])])
         return "\ufeff" + out.getvalue()      # BOM — чтобы Excel открыл кириллицу
 
-    def retry_errors(self):
-        """Кнопка «Повторить отложенные и ошибки»: всё отложенное и с ошибками — снова в очередь, один проход."""
+    def retry_errors(self, auto=False):
+        """Кнопка «Повторить отложенные и ошибки»: всё отложенное и с ошибками — снова в очередь, один проход.
+        Файлы помечаются номером повтора (retry_batch): по нему окно показывает, чем повтор кончился.
+        auto — повтор по расписанию (раз в день/неделю/месяц)."""
+        batch = int(time.time())
         # файл с ошибкой Google, чья копия лежит в буфере, повторно заливается из буфера, а не с Яндекса
         n = self.db.x("UPDATE files SET status=CASE WHEN IFNULL(local_path,'') LIKE '%.dat' THEN 'buffered' "
-                      "ELSE 'pending' END, attempts=0, next_try=0 "
-                      "WHERE status='error' AND IFNULL(note,'') != 'нет на Яндексе'")
-        n2 = self.db.x("UPDATE files SET status='pending', attempts=0, next_try=0 WHERE status='deferred'")
-        n3 = self.db.x("UPDATE files SET next_try=0 WHERE status IN ('pending','buffered') AND next_try>?",
-                       (time.time(),))
+                      "ELSE 'pending' END, attempts=0, next_try=0, retry_batch=? "
+                      "WHERE status='error' AND IFNULL(note,'') != 'нет на Яндексе'", (batch,))
+        n2 = self.db.x("UPDATE files SET status='pending', attempts=0, next_try=0, retry_batch=? "
+                       "WHERE status='deferred'", (batch,))
+        n3 = self.db.x("UPDATE files SET next_try=0, retry_batch=? WHERE status IN ('pending','buffered') AND next_try>?",
+                       (batch, time.time()))
+        self.db.set("deferred.last_retry", batch)
+        if n + n2 + n3:
+            self.db.set("retry.batch", batch)
+            self.db.set("retry.auto", 1 if auto else 0)
         DEAD.clear()
         self.web_problem = ""
         self._new_pass()
@@ -2212,6 +2239,82 @@ class Engine:
         self.log(f"Снова в очередь: отложенных {n2}, с ошибками {n}" + (f", ждавших повтора {n3}" if n3 else "") +
                  ". Нажмите «Старт», если перенос не идёт.")
         return n + n2 + n3
+
+    def deferred_info(self):
+        """Для блока «Отложенные»: сколько их, чем кончился последний повтор, когда следующий по расписанию."""
+        bs = self._stats()["by_status"]
+        d, er = bs.get("deferred", {}), bs.get("error", {})
+        prog = None
+        batch = int(self.db.get("retry.batch") or 0)
+        if batch:
+            by = {r["status"]: (r["n"], r["b"]) for r in self.db.q(
+                "SELECT status, COUNT(*) n, IFNULL(SUM(size),0) b FROM files WHERE retry_batch=? GROUP BY status",
+                (batch,))}
+            total = sum(n for n, _ in by.values())
+            done = by.get("done", (0, 0))[0] + by.get("skipped", (0, 0))[0]
+            again, errors = by.get("deferred", (0, 0))[0], by.get("error", (0, 0))[0]
+            left = total - done - again - errors
+            prog = {"at": batch, "auto": self.db.get("retry.auto") == "1", "total": total, "done": done,
+                    "done_bytes": by.get("done", (0, 0))[1], "deferred": again, "errors": errors, "left": left,
+                    "finished": left == 0 and not self.transferring()}
+        mode = self.settings["deferred_auto"]
+        period = DEFERRED_AUTO.get(mode, 0)
+        last = float(self.db.get("deferred.last_retry") or 0)
+        since = float(self.db.get("deferred.auto_since") or 0)
+        return {"count": d.get("count", 0), "bytes": d.get("bytes", 0), "errors": er.get("count", 0),
+                "retry": prog, "auto": mode, "last_retry": last or None,
+                "next_auto": (max(last, since) + period) if period else None}
+
+    def auto_retry_due(self, now=None):
+        """Пора повторить отложенные по расписанию: задано расписание, есть что повторять, срок вышел."""
+        period = DEFERRED_AUTO.get(self.settings["deferred_auto"], 0)
+        if not period or self.busy() or self.scanning():
+            return False
+        now = now or time.time()
+        last = float(self.db.get("deferred.last_retry") or 0)
+        since = float(self.db.get("deferred.auto_since") or 0)
+        if now < max(last, since) + period:
+            return False
+        return bool(self.db.q1("SELECT 1 FROM files WHERE status='deferred' OR (status='error' "
+                               "AND IFNULL(note,'') != 'нет на Яндексе') LIMIT 1"))
+
+    # ================================================================== карта файлов: экспорт и импорт
+    def export_map(self, dst):
+        """Карта файлов — копия базы (state.sqlite3): тот же формат, что у прошлых версий программы.
+        Токенов и куки в ней нет."""
+        self.db.backup_to(dst)
+
+    def import_map(self, src, with_folders=True):
+        """Добавить в этот профиль файлы из карты прошлой версии или экспорта: пути, размеры, MD5 и что уже
+        перенесено. Уже известные этому профилю файлы не трогаются. Список с Яндекса заново получать не нужно."""
+        if self.busy() or self.scanning():
+            raise ApiError("Сначала остановите перенос и получение списка")
+        snap = os.path.join(self.dir, "import-snapshot.sqlite3")
+        try:
+            res = self.db.import_from(src, snap, auto_retry=self._retry_errors(), with_folders=with_folders)
+        finally:
+            for p in (snap, snap + "-journal", snap + "-wal", snap + "-shm"):
+                _remove(p)
+        kv = res.pop("kv")
+        if kv.get("scan.state") == "done" and self.db.get("scan.state") != "done":
+            for k in ("scan.state", "scan.phase", "scan.found"):
+                if kv.get(k) is not None:
+                    self.db.set(k, kv[k])
+        for k in ("photounlim.size", "photounlim.method"):
+            if kv.get(k) is not None and self.db.get(k) is None:
+                self.db.set(k, kv[k])
+        self.db.recompute_sections(photos_sql(self.settings["photos_from_disk"]))
+        self.db.set("section.mode", self.settings["photos_from_disk"])
+        self.folder_index.clear()
+        self._stats_changed()
+        with self._probe_lock:
+            self._probe_cache = None
+        st = res["by_status"]
+        self.log(f"Импорт карты файлов: добавлено {res['added']} из {res['total']} "
+                 f"(уже были в профиле: {res['total'] - res['added']}). В карте: перенесено {st.get('done', 0)}, "
+                 f"отложено {st.get('deferred', 0)}, ошибок {st.get('error', 0)}, "
+                 f"ждут переноса {st.get('pending', 0)}. Список с Яндекса заново получать не нужно.")
+        return res
 
     def requeue_all(self):
         if self.busy():
@@ -2267,7 +2370,7 @@ class Engine:
             return {"enabled": False, "ram_bytes": self.memq.bytes, "ram_items": len(self.memq),
                     "ram_limit": RAM_QUEUE_MB * MB}
         b = self.buffer if (self.buffer and self.buffer.base == os.path.abspath(s["buffer_dir"])) \
-            else Buffer(s["buffer_dir"])
+            else Buffer(s["buffer_dir"], self.buffer_sub)
         free = total = None
         try:
             du = shutil.disk_usage(b.dir if os.path.isdir(b.dir) else b.base)
