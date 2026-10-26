@@ -48,6 +48,9 @@ DEFAULTS = {
     "yandex_account": "",
     "google_account": "",
     "deferred_auto": "off",               # повторять отложенные сами: off | day | week | month
+    "deferred_auto_thorough": False,      # по расписанию — тщательный проход, а не быстрый повтор
+    "thorough_rounds": 3,                 # тщательный проход: сколько кругов по отложенным
+    "thorough_pause_min": 15,             # и пауза между кругами, мин
     "settings_v": 3,
 }
 
@@ -61,7 +64,7 @@ SHARED_KEYS = ("port", "app_window", "win_autorun", "autostart", "terms_accepted
 DEFERRED_AUTO = {"off": 0, "day": 86400, "week": 7 * 86400, "month": 30 * 86400}
 LIMITS = {"yandex_streams_max": (1, 16), "google_streams": (1, 8), "chunk_mb": (1, 256),
           "max_attempts": (1, 100), "buffer_gb": (1, 10000), "buffer_min_free_gb": (0, 1000),
-          "auto_retry_hours": (0, 168)}
+          "auto_retry_hours": (0, 168), "thorough_rounds": (1, 20), "thorough_pause_min": (1, 1440)}
 
 
 def app_dir():

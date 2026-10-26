@@ -175,11 +175,36 @@ a{color:var(--acc)}
     <h2>Отложенные файлы <span id="defBadge" class="badge"></span></h2>
     <div id="defBody" class="small"></div>
     <div class="row" style="margin-top:10px">
-      <button class="primary" id="btnRetry" onclick="retryDeferred()">↻ Повторить отложенные сейчас</button>
+      <button class="primary" id="btnRetry" onclick="retryDeferred()" title="Один проход, как обычный перенос: что не отдалось с первого раза — снова в «Отложенные»">↻ Быстрый повтор</button>
+      <button id="btnThorough" onclick="thPanelToggle()" title="Несколько кругов, каждому файлу — несколько попыток разными путями">🔍 Тщательный проход…</button>
+      <button id="btnThStop" class="danger" style="display:none" onclick="thoroughStop()">⏹ Остановить тщательный проход</button>
+    </div>
+    <div id="thPanel" class="small" style="display:none;margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:8px">
+      <b>Тщательный проход</b> — для тех немногих файлов, которые быстрый проход не достал. Быстрый проход
+      бережёт время: файл, который Яндекс не отдал сразу, откладывается, чтобы не задерживать остальные.
+      Тщательный, наоборот, возится с каждым:
+      <ul style="margin:6px 0 6px 18px;padding:0">
+        <li>ждёт ответа Яндекса дольше (до минуты, а не 10–25 секунд);</li>
+        <li>даёт каждому файлу до 3 попыток за круг — с паузами 1 и 5 минут: сервер хранения часто оживает за минуты;</li>
+        <li>каждую вторую попытку делает <b>другим путём</b>: через API Яндекса ↔ через сайт Диска (нужны куки из шага 1) — ссылки ведут к разным серверам, и иногда отдаёт только один;</li>
+        <li>не бросает файл, который идёт медленно («по капле»), и докачивает оборванное с места обрыва, а не с нуля;</li>
+        <li>делает несколько кругов с паузой между ними — за паузу Яндекс часто восстанавливает серверы.</li>
+      </ul>
+      Что так и не отдалось, остаётся в «Отложенных» — ничего не теряется. Круг длится не меньше 6–7 минут из-за пауз между попытками; остальные профили в это время ждут.
+      <div class="row" style="margin-top:8px">
+        <label class="small" style="margin:0">Кругов:</label>
+        <select id="thRounds" style="width:auto"><option>1</option><option>2</option><option>3</option><option>5</option><option>10</option></select>
+        <label class="small" style="margin:0">пауза между кругами:</label>
+        <select id="thPause" style="width:auto"><option value="5">5 мин</option><option value="15">15 мин</option><option value="30">30 мин</option><option value="60">1 час</option><option value="180">3 часа</option></select>
+        <button class="primary" onclick="thoroughStart()">🔍 Начать тщательный проход</button>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
       <label class="small" style="margin:0">Повторять сами:</label>
       <select id="deferred_auto" style="width:auto" onchange="saveAuto()">
         <option value="off">нет, только вручную</option><option value="day">раз в день</option>
         <option value="week">раз в неделю</option><option value="month">раз в месяц</option></select>
+      <label class="small" style="margin:0" title="По расписанию запускать тщательный проход (с кругами и паузами из настроек выше), а не быстрый повтор"><input type="checkbox" id="deferred_auto_thorough" style="width:auto;vertical-align:middle" onchange="saveAuto()"> тщательным проходом</label>
       <span class="small muted" id="defNext"></span>
     </div>
     <div class="row small" style="margin-top:8px">
@@ -681,6 +706,11 @@ async function refresh(){
     done:['Завершено','b-ok'],attention:['Нужно ваше внимание','b-err']};
   let [txt,cls] = map[t.state]||[t.state,''];
   if(t.state==='done' && sum('deferred').count){ txt=`Проход завершён · отложено ${nf(sum('deferred').count)}`; cls='b-warn'; }
+  const th = s.deferred.thorough;
+  if(th && th.active){
+    if(t.state==='running') txt = `Тщательный проход · круг ${th.round} из ${th.rounds}`;
+    else if(th.next){ txt = `Тщательный проход · пауза до ${dt(th.next)}`; cls='b-acc'; }
+  }
   const myQ = s.profiles.find(p=>p.id===PROFILE);
   if(t.state!=='running' && myQ && myQ.waiting){ txt='Ждёт: переносит другой профиль'; cls='b-warn'; }
   if(s.queue.active && t.state!=='running'){ const cur = s.profiles.find(p=>p.id===s.queue.current); if(cur && cur.id!==PROFILE){ txt=`Очередь: сейчас «${cur.name}»`; cls='b-acc'; } }
@@ -993,19 +1023,66 @@ async function retryDeferred(){
   }catch(e){ alert(e.message); }
 }
 async function saveAuto(){
-  try{ await post('/api/settings', {deferred_auto: $('deferred_auto').value}, true); settings.deferred_auto = $('deferred_auto').value; }
+  const v = {deferred_auto: $('deferred_auto').value, deferred_auto_thorough: $('deferred_auto_thorough').checked};
+  try{ await post('/api/settings', v, true); Object.assign(settings, v); }
   catch(e){ alert(e.message); }
 }
+function thPanelToggle(){
+  const p = $('thPanel'), d = lastStatus && lastStatus.deferred;
+  if(p.style.display === 'none' && d){
+    for(const [id, v] of [['thRounds', d.rounds], ['thPause', d.pause_min]]){
+      const sel = $(id);
+      if(![...sel.options].some(o => +o.value === v)) sel.add(new Option(id==='thPause' ? v+' мин' : String(v), v));
+      sel.value = String(v);
+    }
+  }
+  p.style.display = p.style.display === 'none' ? '' : 'none';
+}
+async function thoroughStart(){
+  const d = lastStatus && lastStatus.deferred;
+  const n = d ? d.count : 0, er = d ? d.errors : 0;
+  if(!n && !er){ alert('Отложенных файлов и ошибок нет — проходить нечего.'); return; }
+  const rounds = +$('thRounds').value, pause = +$('thPause').value;
+  if(!confirm(`Тщательный проход: ${n ? nf(n)+' из «Отложенных»' : ''}${n&&er?' и ':''}${er ? er+' с ошибками' : ''}, кругов — ${rounds}, пауза между кругами — ${$('thPause').selectedOptions[0].text}.\n\nПеренос запустится сам. Ход прохода будет виден в этом блоке; остановить можно в любой момент.`)) return;
+  try{
+    const r = await post('/api/deferred/thorough', {rounds, pause_min: pause}, true);
+    $('thPanel').style.display = 'none';
+    if(r.queued) alert(`Сейчас переносит профиль «${r.after}» — тщательный проход этого профиля начнётся сразу после него.`);
+  }catch(e){ alert(e.message); }
+}
+async function thoroughStop(){
+  if(!confirm('Остановить тщательный проход? Файлы, до которых он не дошёл, останутся в очереди или в «Отложенных» — ничего не потеряется.')) return;
+  try{ await post('/api/deferred/thorough_stop', {}, true); }catch(e){ alert(e.message); }
+}
+function inMin(ts){ const m = Math.max(0, Math.round((ts - Date.now()/1000)/60)); return m < 1 ? 'меньше минуты' : m < 60 ? m+' мин' : Math.floor(m/60)+' ч '+(m%60)+' мин'; }
 function dt(ts){ return new Date(ts*1000).toLocaleString('ru',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }
 function renderDeferred(s){
   const d = s.deferred, r = d.retry, running = s.transfer.state==='running';
   $('defBadge').textContent = d.count ? nf(d.count) : 'нет';
   $('defBadge').className = 'badge ' + (d.count ? 'b-warn' : 'b-ok');
+  const th = d.thorough;
   let h = d.count
-    ? `<b>${nf(d.count)} (${fmtB(d.bytes)})</b> Яндекс пока не отдал. Они не потеряны: программа их не трогает, пока вы не нажмёте «Повторить» или не настанет время повтора по расписанию.`
-    : 'Отложенных файлов нет.';
-  if(d.errors) h += ` Ещё ${nf(d.errors)} с ошибками — «Повторить» берёт и их.`;
-  if(r && r.total){
+    ? `<b>${nf(d.count)} (${fmtB(d.bytes)})</b> Яндекс пока не отдал. Они не потеряны: программа их не трогает, пока вы не запустите повтор или не настанет время повтора по расписанию.`
+    : (th && th.active && th.left ? 'Все отложенные сейчас в работе у тщательного прохода.' : 'Отложенных файлов нет.');
+  if(d.errors) h += ` Ещё ${nf(d.errors)} с ошибками — повтор берёт и их.`;
+  if(th){
+    const st = th.started || th.total;
+    let head, tail = '';
+    if(!th.active) head = `<b>Последний тщательный проход</b> от ${dt(th.batch)}${th.auto?' (по расписанию)':''}: ` +
+      (th.stopped ? `остановлен на круге ${th.round} из ${th.rounds}` : `${th.round} из ${th.rounds} кругов — готово`);
+    else if(th.running) head = `<b>Идёт тщательный проход</b>${th.auto?' (по расписанию)':''}: круг ${th.round} из ${th.rounds}`;
+    else if(th.next) head = `<b>Тщательный проход</b>: круг ${th.round} из ${th.rounds} закончен, следующий — ${dt(th.next)} (через ${inMin(th.next)})`;
+    else head = `<b>Тщательный проход</b>: круг ${th.round} из ${th.rounds}`;
+    if(th.active && !th.running && !th.next && th.left) tail = 'Перенос сейчас не идёт — нажмите «▶ Старт», чтобы круг продолжился, или «Остановить тщательный проход».';
+    else if(!th.active) tail = th.deferred ? 'Не отдавшиеся остались в «Отложенных»: их можно пройти ещё раз позже — Яндекс со временем восстанавливает серверы.' : (th.done ? 'Все достали — они уже на Google Drive.' : '');
+    else if(th.running) tail = 'Не отдавшийся с первого раза файл ждёт 1–5 минут и пробуется снова, через раз — другим путём (API ↔ сайт Диска). Подробности — в журнале.';
+    h += `<div style="margin-top:10px">${head}</div>
+      <div class="bar" style="margin-top:4px"><div class="ok" style="width:${pct(th.done,st).toFixed(1)}%"></div><div class="ya" style="width:${pct(th.deferred+th.errors,st).toFixed(1)}%"></div></div>
+      <div class="muted" style="margin-top:4px">✅ достали ${th.done.toLocaleString('ru')} из ${nf(st)}${th.done_bytes?' ('+fmtB(th.done_bytes)+')':''} ·
+        ⏳ пока не отдались ${th.deferred.toLocaleString('ru')}${th.errors?' · ❌ ошибок '+th.errors:''}${th.left?' · в работе '+th.left.toLocaleString('ru'):''}</div>
+      ${tail ? `<div class="muted">${tail}</div>` : ''}`;
+  }
+  if(r && r.total && !(th && th.batch === r.at)){
     const proc = r.done + r.deferred + r.errors;
     h += `<div style="margin-top:10px"><b>${r.finished ? 'Последний повтор' : 'Идёт повтор'}</b> от ${dt(r.at)}${r.auto?' (по расписанию)':''}:
       ${r.finished ? 'готово' : `проверено ${proc.toLocaleString('ru')} из ${nf(r.total)}`}</div>
@@ -1016,10 +1093,16 @@ function renderDeferred(s){
     else if(!running && r.left) h += `<div class="muted">Перенос сейчас не идёт — нажмите «▶ Старт», чтобы повтор продолжился.</div>`;
   }
   $('defBody').innerHTML = h;
-  $('btnRetry').disabled = !(d.count || d.errors);
-  $('btnRetry').textContent = '↻ Повторить отложенные сейчас' + (d.count ? ` (${d.count.toLocaleString('ru')})` : '');
+  const thActive = !!(th && th.active);
+  $('btnRetry').disabled = !(d.count || d.errors) || thActive;
+  $('btnRetry').textContent = '↻ Быстрый повтор' + (d.count ? ` (${d.count.toLocaleString('ru')})` : '');
+  $('btnThorough').style.display = thActive ? 'none' : '';
+  $('btnThorough').disabled = !(d.count || d.errors);
+  $('btnThStop').style.display = thActive ? '' : 'none';
+  if(thActive) $('thPanel').style.display = 'none';
   if(document.activeElement !== $('deferred_auto')) $('deferred_auto').value = d.auto;
-  $('defNext').textContent = d.next_auto ? `следующий автоматический повтор: ${dt(d.next_auto)}${d.next_auto < Date.now()/1000 ? ' (как только освободится перенос)' : ''}`
+  $('deferred_auto_thorough').checked = !!d.auto_thorough;
+  $('defNext').textContent = d.next_auto ? `следующий автоматический ${d.auto_thorough ? 'тщательный проход' : 'повтор'}: ${dt(d.next_auto)}${d.next_auto < Date.now()/1000 ? ' (как только освободится перенос)' : ''}`
     : (d.last_retry ? `последний повтор: ${dt(d.last_retry)}` : '');
 }
 

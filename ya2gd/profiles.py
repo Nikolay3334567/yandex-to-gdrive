@@ -229,7 +229,7 @@ class Manager:
             e.log("Списка файлов ещё нет — получаю его, перенос пойдёт следом")
             e.start_scan()
         self._launched.add(pid)
-        return e.start_transfer()
+        return e.start_transfer(patient=e.thorough_active())
 
     def queue_start(self):
         """«Перенести отмеченные профили по очереди». Если очередь была на паузе — продолжает её."""
@@ -304,10 +304,18 @@ class Manager:
                 if pid in self.engines and self._try_launch(pid):
                     return
             for pid, e in self.engines.items():
+                if e.thorough_step():            # следующий круг тщательного прохода
+                    self._try_launch(pid)
+                    return
+            for pid, e in self.engines.items():
                 if e.auto_retry_due():
-                    n = e.retry_errors(auto=True)
-                    e.log(f"Повтор отложенных по расписанию ({AUTO_NAMES.get(e.settings['deferred_auto'], '')}): "
-                          f"{n} файлов снова в очереди")
+                    when = AUTO_NAMES.get(e.settings['deferred_auto'], '')
+                    if e.settings["deferred_auto_thorough"]:
+                        e.log(f"По расписанию ({when}) — тщательный проход по отложенным")
+                        e.thorough_start(auto=True)
+                    else:
+                        n = e.retry_errors(auto=True)
+                        e.log(f"Повтор отложенных по расписанию ({when}): {n} файлов снова в очереди")
                     self._try_launch(pid)
                     return
 

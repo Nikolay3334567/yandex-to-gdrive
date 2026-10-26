@@ -113,14 +113,21 @@ PROBE_TIMEOUT = (3.0, 8.0)          # для «молчащего» сервер
 
 MIN_SPEED = float(os.environ.get("YA2GD_MIN_SPEED", str(8 * 1024)))       # байт/с
 SPEED_WINDOW = float(os.environ.get("YA2GD_SPEED_WINDOW", "120"))
+# «Тщательный проход» по отложенным: ждём Яндекс дольше и терпим медленную отдачу — файлов мало,
+# и каждый хочется достать, а не пропустить ради скорости остальных
+PATIENT_CONNECT = float(os.environ.get("YA2GD_PATIENT_CONNECT", "20"))
+PATIENT_READ = float(os.environ.get("YA2GD_PATIENT_READ", "60"))
+PATIENT_MIN_SPEED = 1024
+PATIENT_SPEED_WINDOW = 300.0
 
 
 class SpeedGuard:
     """Сторож скорости: сервер, который отдаёт файл «по капле» (меньше MIN_SPEED за SPEED_WINDOW),
     держал бы поток часами — такой файл лучше отложить и взять доступные."""
 
-    def __init__(self, name):
+    def __init__(self, name, patient=False):
         self.name = name
+        self.min_speed, self.window = (PATIENT_MIN_SPEED, PATIENT_SPEED_WINDOW) if patient else (MIN_SPEED, SPEED_WINDOW)
         self.start = time.time()
         self.marks = [(self.start, 0)]
         self.total = 0
@@ -130,10 +137,10 @@ class SpeedGuard:
         now = time.time()
         if now - self.marks[-1][0] >= 5:
             self.marks.append((now, self.total))
-            while len(self.marks) > 2 and self.marks[1][0] <= now - SPEED_WINDOW:
+            while len(self.marks) > 2 and self.marks[1][0] <= now - self.window:
                 self.marks.pop(0)
         t0, b0 = self.marks[0]
-        if now - t0 >= SPEED_WINDOW and (self.total - b0) < MIN_SPEED * (now - t0):
+        if now - t0 >= self.window and (self.total - b0) < self.min_speed * (now - t0):
             speed = (self.total - b0) / max(1.0, now - t0)
             raise StorageDown(None, f"Яндекс отдаёт «{self.name}» по капле ({speed / 1024:.1f} КБ/с) — файл отложен")
 
@@ -143,11 +150,12 @@ def is_yandex_host(url):
     return host == "localhost" or host.startswith("127.") or any(host.endswith(d) for d in YANDEX_HOSTS)
 
 
-def open_download(url, offset=0, sess=None, reject_pages=False, length=None):
+def open_download(url, offset=0, sess=None, reject_pages=False, length=None, patient=False):
     """Открывает поток файла с байта offset. Возвращает (response, фактическое_смещение).
 
     reject_pages: оригинал фото/видео никогда не приходит HTML/JSON — это отказ Яндекса.
     length: нужны только первые length байт (замер, разметка) — сервер не начинает отдавать весь файл.
+    patient: тщательный проход — ждать Яндекс дольше, «молчавшие» серверы пробовать с полными таймаутами.
     """
     s = sess or session()
     headers = {"Accept-Encoding": "identity"}
@@ -158,7 +166,8 @@ def open_download(url, offset=0, sess=None, reject_pages=False, length=None):
     host = ""
     try:
         r = s.get(url, headers=headers, stream=True, allow_redirects=False,
-                  timeout=(STORAGE_TIMEOUT, FRONT_READ_TIMEOUT))
+                  timeout=(PATIENT_CONNECT, max(PATIENT_READ, FRONT_READ_TIMEOUT)) if patient
+                  else (STORAGE_TIMEOUT, FRONT_READ_TIMEOUT))
         hops = 0
         while r.status_code in _REDIRECTS and r.headers.get("Location") and hops < 5:
             loc = urljoin(r.url, r.headers["Location"])
@@ -166,7 +175,10 @@ def open_download(url, offset=0, sess=None, reject_pages=False, length=None):
             host = urlsplit(loc).hostname or ""
             # подключение — STORAGE_TIMEOUT; молчание дольше STREAM_READ_TIMEOUT посреди потока — обрыв.
             # Недавно молчавший сервер пробуем с короткими таймаутами, а не пропускаем без попытки.
-            timeout = PROBE_TIMEOUT if DEAD.is_dead(host) else (STORAGE_TIMEOUT, STREAM_READ_TIMEOUT)
+            if patient:
+                timeout = (PATIENT_CONNECT, max(PATIENT_READ, STREAM_READ_TIMEOUT))
+            else:
+                timeout = PROBE_TIMEOUT if DEAD.is_dead(host) else (STORAGE_TIMEOUT, STREAM_READ_TIMEOUT)
             r = s.get(loc, headers=headers, stream=True, allow_redirects=False, timeout=timeout)
             hops += 1
     except NETWORK_ERRORS as e:

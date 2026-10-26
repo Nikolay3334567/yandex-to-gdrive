@@ -681,6 +681,54 @@ def scenario_profiles(e):
     print("OK перенос из папки прошлой версии: карта и аккаунты подхвачены, вход заново не нужен, дублей аккаунтов нет")
 
 
+def scenario_thorough(e):
+    """Тщательный проход: что быстрый проход отложил, достаётся повторными попытками с паузами и другим путём."""
+    app = e.app
+    app.start()
+    flaky, api_dead, dead = "disk:/Много/Папка0/file0.bin", "disk:/Документы/отчёт.pdf", "disk:/корень.txt"
+    app.post("/api/settings", dict(GOOD, yandex_cookies=COOKIES, terms_accepted=True))
+    e.faults(flaky={flaky: 3}, api_dead=[api_dead], e504=[dead])    # 504 трижды, потом отдаётся
+    app.post("/api/scan/start", {"fresh": True})
+    wait_for(lambda: app.get("/api/status")["scan"]["state"] == "done", 60, "scan")
+    app.post("/api/transfer/start")
+    wait_for(lambda: app.state() == "done", 120, "быстрый проход")
+    assert deferred(app) == 3, app.get("/api/status")["stats"]["by_status"]
+    print("OK быстрый проход: три капризных файла — в «Отложенных»")
+
+    code, r = app.post("/api/deferred/thorough", {"rounds": 2, "pause_min": 1})
+    assert code == 200 and r["n"] == 3 and r["ok"], r
+
+    def th():
+        return app.get("/api/status")["deferred"]["thorough"] or {}
+    wait_for(lambda: th().get("next"), 120, "первый круг тщательного прохода")
+    t = th()
+    assert t["active"] and t["round"] == 1 and t["done"] == 2 and t["deferred"] == 1, t
+    code, r = app.post("/api/deferred/retry")
+    assert code != 200, r                                   # быстрый повтор не мешает тщательному
+    assert app.logfile_has("другим путём") and app.logfile_has("Тщательный проход: круг 1 из 2 закончен")
+    print("OK круг 1: файл, отдавшийся с третьей попытки, и файл, который отдаётся только через сайт, — достали")
+
+    import sqlite3
+    c = sqlite3.connect(os.path.join(e.ddir, "state.sqlite3"), timeout=30)
+    c.execute("UPDATE kv SET value='1' WHERE key='thorough.next'")      # пауза между кругами прошла
+    c.commit()
+    c.close()
+    wait_for(lambda: not th().get("active"), 120, "второй круг тщательного прохода")
+    t = th()
+    assert t["round"] == 2 and t["done"] == 2 and t["deferred"] == 1, t
+    assert app.logfile_has("Тщательный проход завершён (2 из 2 кругов): достали 2 из 3")
+    st = app.get("/api/status")["stats"]["by_status"]
+    assert st["deferred"]["count"] == 1 and "error" not in st, st
+    print("OK круг 2 после паузы: мёртвый файл попробован ещё раз и остался в «Отложенных»; итог в журнале")
+
+    e.faults(e504=[])
+    code, r = app.post("/api/deferred/retry")
+    assert code == 200 and r["n"] == 1, r
+    finish(app)
+    check(app, e.M)
+    print("OK быстрый повтор после тщательного прохода работает как раньше; на Drive всё без дублей")
+
+
 def check(app, M):
     """Каждый файл Яндекса лежит на Drive ровно один раз, в правильной папке, с правильным MD5."""
     drive = http("GET", M + "/ctl/drive")[1]
@@ -725,7 +773,8 @@ if __name__ == "__main__":
                  ("dead_many", scenario_dead_many, {"YA2GD_FRONT_TIMEOUT": "2", "YA2GD_BREAKER_STREAK": "10",
                                                     "YA2GD_BREAKER_QUIET": "3", "YA2GD_API_COOLDOWN": "2"}),
                  ("probe", scenario_probe, {"YA2GD_FRONT_TIMEOUT": "2", "YA2GD_SPEEDTEST_SECONDS": "2"}),
-                 ("profiles", scenario_profiles, {"YA2GD_PROFILES_TICK": "1"})]
+                 ("profiles", scenario_profiles, {"YA2GD_PROFILES_TICK": "1"}),
+                 ("thorough", scenario_thorough, {"YA2GD_PROFILES_TICK": "1", "YA2GD_PATIENT_DELAY": "1"})]
     for name, fn, extra in scenarios:
         if only and name not in only:
             continue

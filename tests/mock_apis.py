@@ -52,6 +52,8 @@ class State:
                        "ya_429": 0,         # сколько раз подряд ответить 429 на ссылку для скачивания
                        "hang": {},          # путь → сколько секунд «первый» сервер Яндекса молчит перед ответом
                        "rest_500": False,   # API Яндекса отвечает 500 на запрос ссылки (Яндекс лежит целиком)
+                       "flaky": {},         # путь → сколько первых скачиваний ответить 504 (потом отдаётся)
+                       "api_dead": [],      # пути, которые не отдаются по ссылке из API, но отдаются через сайт
                        "web_session": "good-session"}
         self.calls = {"chunks": 0, "mpfs_url": 0, "small_uploads": 0, "previews": 0, "ya_download_links": 0,
                       "ranges": 0, "head_ranges": 0, "max_parallel_dl": 0, "upload_cancel": 0}
@@ -151,7 +153,7 @@ class H(BaseHTTPRequestHandler):
             if path not in S.ya:
                 return self.send_json(404, {"error": "DiskNotFoundError", "description": "Не найдено"})
             return self.send_json(200, {"href": f"http://127.0.0.1:{self.server.server_address[1]}/dl?"
-                                                + urllib.parse.urlencode({"p": path})})
+                                                + urllib.parse.urlencode({"p": path, "via": "api"})})
         return self.send_json(404, {"error": "nf"})
 
     def downloader(self, qs):
@@ -165,7 +167,8 @@ class H(BaseHTTPRequestHandler):
             return self.send_json(504, {"error": "gateway timeout"})
         host = "localhost" if p in S.faults["dead"] else "127.0.0.1"   # «молчащий» сервер — другой хост
         self.send_response(302)
-        self.send_header("Location", f"http://{host}:{port}/st?" + urllib.parse.urlencode({"p": p}))
+        self.send_header("Location", f"http://{host}:{port}/st?" + urllib.parse.urlencode(
+            {"p": p, "via": qs.get("via", "web")}))
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -182,6 +185,14 @@ class H(BaseHTTPRequestHandler):
 
     def dl(self, qs):
         if qs["p"] in S.faults["e504"]:
+            return self.send_json(504, {"error": "gateway timeout"})
+        if qs.get("via") == "api" and qs["p"] in S.faults["api_dead"]:
+            return self.send_json(504, {"error": "gateway timeout"})
+        with S.lock:
+            left = S.faults["flaky"].get(qs["p"], 0)
+            if left:
+                S.faults["flaky"][qs["p"]] = left - 1
+        if left:
             return self.send_json(504, {"error": "gateway timeout"})
         with S.lock:
             S.parallel += 1

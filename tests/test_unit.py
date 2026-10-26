@@ -654,9 +654,10 @@ def test_queue_and_schedule():
             e.db.set("scan.state", "done")
             e.transferring = lambda: run.get(e.profile_id) == "run"
 
-            def start():
+            def start(patient=False):
                 run[e.profile_id] = "run"
                 e.transfer_state = "running"
+                e.patient = patient
                 return True
             e.start_transfer = start
         for e in m.engines.values():
@@ -714,6 +715,120 @@ def test_queue_and_schedule():
             x.log.close()
         print("OK очередь профилей друг за другом (пауза и продолжение), ожидание «Старта», "
               "повтор отложенных по расписанию раз в день")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_thorough_pass():
+    """Тщательный проход: до PATIENT_TRIES попыток на файл за круг с паузами, каждая вторая — другим путём,
+    терпимые правила «бросить»; круги с паузой между ними; итог; расписание может запускать его вместо быстрого."""
+    from ya2gd import profiles as P
+    from ya2gd.engine import PATIENT_TRIES, PATIENT_DELAY
+    from ya2gd.fetch import SpeedGuard, PATIENT_MIN_SPEED, MIN_SPEED
+    from ya2gd.http_util import ApiError
+    d = tempfile.mkdtemp()
+    try:
+        m = P.Manager(d)
+        e = m.main
+        run = {}
+        e.db.set("scan.state", "done")
+        e.transferring = lambda: run.get("main") == "run"
+
+        def start(patient=False):
+            run["main"] = "run"
+            run["patient"] = patient
+            e.patient = patient
+            e._patient_tries = {}
+            e.transfer_state = "running"
+            return True
+        e.start_transfer = start
+
+        def finish():
+            run["main"] = "stop"
+            e.transfer_state = "done"
+        e._found([{"path": f"disk:/f{i}.jpg", "source": "disk", "name": f"f{i}.jpg", "size": 5} for i in range(3)], 1)
+        try:
+            e.thorough_start(2, 5)
+            raise AssertionError("без отложенных проходить нечего")
+        except ApiError:
+            pass
+        e.db.x("UPDATE files SET status='deferred'")
+
+        # отдельные попытки: пауза растёт, вторая — другим путём, после PATIENT_TRIES — в «Отложенные»
+        e.patient, e._patient_tries = True, {}
+        e.settings.update(yandex_token="tok", yandex_cookies='[{"name":"Session_id","value":"s"}]')
+        row = dict(e.db.q("SELECT * FROM files WHERE path='disk:/f0.jpg'")[0])
+        assert not e._alt_way(row)
+        t0 = time.time()
+        e._defer(row, "504")
+        r = e.db.q("SELECT * FROM files WHERE id=?", (row["id"],))[0]
+        assert r["status"] == "pending" and t0 + PATIENT_DELAY - 1 <= r["next_try"] <= time.time() + PATIENT_DELAY + 1
+        assert "попытка 2 из" in r["note"] and "другим путём" in r["note"] and e._alt_way(row)
+
+        class Y:
+            def download_href(self, path):
+                return "api-link"
+
+        class W:
+            def file_url(self, path):
+                return "web-link"
+
+            def session(self):
+                return "web-session"
+        e.yandex, e.yaweb = (lambda stop=None: Y()), (lambda stop=None: W())
+        assert e._link(row)[2] is True                       # вторая попытка — через сайт
+        e._defer(row, "504")
+        r = e.db.q("SELECT * FROM files WHERE id=?", (row["id"],))[0]
+        assert r["status"] == "pending" and r["next_try"] >= time.time() + PATIENT_DELAY * 4 and not e._alt_way(row)
+        assert e._link(row)[2] is False                      # третья — снова через API
+        for _ in range(PATIENT_TRIES - 2):
+            e._defer(row, "504")
+        assert e.db.q("SELECT status FROM files WHERE id=?", (row["id"],))[0]["status"] == "deferred"
+        assert not e._give_up(False, 1, 1) and e._give_up(False, 2, 1) and not e._give_up(True, 3, 50)
+        assert SpeedGuard("x", True).min_speed == PATIENT_MIN_SPEED < MIN_SPEED == SpeedGuard("x").min_speed
+        e.patient = False
+        assert e._give_up(False, 1, 1) and not e._alt_way(row) and e._link(row)[2] is False
+
+        # круги: старт → первый круг в тщательном режиме
+        e.db.x("UPDATE files SET status='deferred'")
+        assert e.thorough_start(2, 5) == 3 and e.thorough_active()
+        assert m.start("main")["ok"] and run["patient"] is True
+        e.db.x("UPDATE files SET status='done' WHERE path='disk:/f0.jpg'")
+        e.db.x("UPDATE files SET status='deferred' WHERE path!='disk:/f0.jpg'")
+        finish()
+        m._tick()                                             # круг закончен — пауза
+        th = e.thorough_info()
+        assert run["main"] == "stop" and th["round"] == 1 and th["next"] > time.time() + 290, th
+        assert e.deferred_info()["thorough"]["done"] == 1 and not e.auto_retry_due()
+        m._tick()
+        assert run["main"] == "stop"                          # пауза ещё идёт
+        e.db.set("thorough.next", 1)
+        m._tick()                                             # второй круг: отложенные снова в очереди
+        assert run["main"] == "run" and run["patient"] and e.db.count_status("pending") == 2
+        assert e.thorough_info()["round"] == 2
+        e.db.x("UPDATE files SET status='done' WHERE path='disk:/f1.jpg'")
+        e.db.x("UPDATE files SET status='deferred' WHERE path='disk:/f2.jpg'")
+        finish()
+        m._tick()
+        th = e.thorough_info()
+        assert not th["active"] and th["done"] == 2 and th["deferred"] == 1 and run["main"] == "stop", th
+        # «Остановить» посреди прохода
+        e.thorough_start(1, 1)
+        e.thorough_stop()
+        assert not e.thorough_active() and e.thorough_info()["stopped"]
+        # по расписанию — тщательный проход
+        e.db.x("UPDATE files SET status='deferred' WHERE path='disk:/f2.jpg'")
+        e.settings.update(deferred_auto="day", deferred_auto_thorough=True, thorough_rounds=4)
+        e.db.set("deferred.last_retry", time.time() - 2 * 86400)
+        e.db.set("deferred.auto_since", 0)
+        finish()
+        m._tick()
+        th = e.thorough_info()
+        assert run["main"] == "run" and run["patient"] and th["active"] and th["auto"] and th["rounds"] == 4, th
+        e.db.close()
+        e.log.close()
+        print("OK тщательный проход: попытки с растущими паузами, вторая — другим путём, терпимость к медленным; "
+              "круги с паузой и итог; «Остановить»; запуск по расписанию")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -819,6 +934,7 @@ if __name__ == "__main__":
     test_probe_estimate()
     test_profiles_and_accounts()
     test_queue_and_schedule()
+    test_thorough_pass()
     test_import_export_map()
     test_db_claims()
     print("\nМОДУЛЬНЫЕ ПРОВЕРКИ ПРОЙДЕНЫ")

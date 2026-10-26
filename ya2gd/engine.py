@@ -57,6 +57,10 @@ RETRY_PAUSE = float(os.environ.get("YA2GD_RETRY_PAUSE", "3"))       # пауза
 BREAKER_STREAK = int(os.environ.get("YA2GD_BREAKER_STREAK", "30"))
 BREAKER_QUIET = float(os.environ.get("YA2GD_BREAKER_QUIET", "180"))
 RAM_QUEUE_MB = int(os.environ.get("YA2GD_RAM_QUEUE_MB", "256"))
+# «Тщательный проход» по отложенным (patient): до PATIENT_TRIES попыток на файл за круг, между ними —
+# пауза PATIENT_DELAY, потом впятеро дольше; каждая вторая попытка — другим путём (API ↔ сайт Диска)
+PATIENT_TRIES = int(os.environ.get("YA2GD_PATIENT_TRIES", "3"))
+PATIENT_DELAY = float(os.environ.get("YA2GD_PATIENT_DELAY", "60"))
 MEDIA_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/heic": ".heic",
              "image/avif": ".avif"}
 
@@ -434,6 +438,8 @@ class Engine:
         self._link_excused = set()            # файлы, которым сбой выдачи ссылок уже раз не засчитан
         self._probe_lock = threading.Lock()
         self._probe_cache = None
+        self.patient = False                  # идёт «тщательный проход» (см. thorough_start)
+        self._patient_tries = {}              # сколько раз файл уже не отдался в этом круге
 
     # ================================================================== клиенты
     def yandex(self, stop=None):
@@ -728,7 +734,8 @@ class Engine:
         return bool(self.scan_thread and self.scan_thread.is_alive())
 
     # ================================================================== перенос: запуск/остановка
-    def start_transfer(self):
+    def start_transfer(self, patient=False):
+        """patient — круг «тщательного прохода» по отложенным: дольше ждать Яндекс, больше попыток, другой путь."""
         with self.lock:
             if self.transferring():
                 return False
@@ -749,6 +756,8 @@ class Engine:
             self.web_problem = ""
             self.deferred_now = 0
             self._new_pass()
+            self.patient = bool(patient)
+            self._patient_tries = {}
             self.db.set("transfer.wanted", 1)
             self.gate.configure(s["yandex_streams_max"], s["yandex_adaptive"])
             self.downloaders = [threading.Thread(target=self._downloader, args=(i,), daemon=True, name=f"ya{i}")
@@ -761,6 +770,10 @@ class Engine:
             self.supervisor.start()
             buf = (f"буфер: {self.buffer.base} (до {s['buffer_gb']} ГБ)" if self.buffer
                    else f"без буфера на диске (до {RAM_QUEUE_MB} МБ в памяти)")
+            if self.patient:
+                self.log(f"Тщательный проход, круг {self.db.get('thorough.round') or 1}: каждому файлу — до "
+                         f"{PATIENT_TRIES} попыток с паузами, дольше ожидание Яндекса, каждая вторая попытка — "
+                         f"другим путём; медленные файлы не бросаются, недокачанное докачивается")
             self.log(f"Перенос запущен: к Яндексу до {s['yandex_streams_max']} потоков "
                      f"({'подбираются автоматически' if s['yandex_adaptive'] else 'фиксировано'}), "
                      f"к Google — {s['google_streams']}; {buf}")
@@ -855,8 +868,10 @@ class Engine:
                     dfr = st.get("deferred", {})
                     self.log(f"Проход завершён. Перенесено и сверено: {st.get('done', {}).get('count', 0)}; "
                              f"отложено (Яндекс не отдал): {dfr.get('count', 0)} ({dfr.get('bytes', 0) / GB:.1f} ГБ); "
-                             f"ошибок: {st.get('error', {}).get('count', 0)}. Отложенные можно повторить кнопкой "
-                             f"«Повторить отложенные и ошибки» — например, когда Яндекс восстановит серверы.")
+                             f"ошибок: {st.get('error', {}).get('count', 0)}." +
+                             (" Круг тщательного прохода закончен." if self.patient else
+                              " Отложенные можно повторить кнопкой «Повторить отложенные и ошибки» — например, "
+                              "когда Яндекс восстановит серверы."))
         winsys.allow_sleep()
         if winsys.WIN:
             winsys.set_title(self._title())
@@ -1302,6 +1317,22 @@ class Engine:
         а скачать давно ничего не удаётся, «предохранитель» возвращает файлы в очередь и ставит паузу.
         Каждый файл возвращается не больше одного раза за запуск — иначе мёртвые файлы ходили бы по кругу."""
         fid = row["id"]
+        if self.patient:
+            with self.lock:
+                n = self._patient_tries.get(fid, 0) + 1
+                self._patient_tries[fid] = n
+            if n < PATIENT_TRIES:
+                keep = self._keep_partial(row)
+                delay = PATIENT_DELAY * 5 ** (n - 1)
+                other = self._alt_way(row) and bool(self.settings["yandex_token"]) and \
+                    bool(self.settings["yandex_cookies"]) and not self.web_problem
+                self.db.update_file(fid, status="pending", next_try=time.time() + delay, last_error=reason[:1000],
+                                    note=f"тщательный проход: попытка {n + 1} из {PATIENT_TRIES} через {_dur(delay)}"
+                                         + (" другим путём" if other else ""),
+                                    **({} if keep else {"local_path": None}))
+                self.log(f"Не отдался «{row['path']}» ({reason}) — ещё попытка через {_dur(delay)}"
+                         + (" другим путём (API ↔ сайт Диска)" if other else ""), "warn")
+                return
         keep = self._keep_partial(row)
         # метка разметки устарела: последнее слово — за переносом
         self.db.update_file(fid, status="deferred", next_try=0, defers=(row.get("defers") or 0) + 1,
@@ -1334,7 +1365,8 @@ class Engine:
 
     def _keep_partial(self, row):
         """Оставлять ли недокачанную часть в буфере для ручного повтора: да, если она большая (≥64 МБ)
-        и все такие части вместе занимают не больше четверти буфера."""
+        и все такие части вместе занимают не больше четверти буфера. В тщательном проходе — любая от 1 МБ,
+        до половины буфера: следующая попытка продолжит с места обрыва."""
         part = row.get("local_path")
         if not part:
             return False
@@ -1349,7 +1381,8 @@ class Engine:
                 held += os.path.getsize(r["local_path"])
             except OSError:
                 pass
-        if have >= 64 * MB and held + have <= self.settings["buffer_gb"] * BUF_UNIT // 4:
+        least, share = (MB, 2) if self.patient else (64 * MB, 4)
+        if have >= least and held + have <= self.settings["buffer_gb"] * BUF_UNIT // share:
             return True
         _remove(part)
         return False
@@ -1377,12 +1410,22 @@ class Engine:
         self.db.update_file(fid, status="pending", attempts=attempts, last_error=str(e)[:1000],
                             next_try=now + 60)
 
+    def _alt_way(self, row):
+        """Тщательный проход: каждая вторая попытка файла — другим путём (API ↔ сайт Диска). Ссылки двух путей
+        ведут к Яндексу через разные серверы, и иногда отдаёт только один из них."""
+        return self.patient and self._patient_tries.get(row["id"], 0) % 2 == 1
+
     def _link(self, row, stop=None):
         """(ссылка, HTTP-сессия, это_веб_версия). «Файлы» — через API, при отказе API — через сайт."""
         stop = stop or self.stop_transfer
         cookies = bool(self.settings["yandex_cookies"]) and not self.web_problem
         web = (row["source"] == "photounlim" and self.photounlim_mode() == "web") or \
             (row["source"] == "disk" and cookies and (self.rest_broken or not self.settings["yandex_token"]))
+        if self._alt_way(row):
+            if not web and cookies:
+                web = True
+            elif web and self.settings["yandex_token"] and not (row["source"] == "disk" and self.rest_broken):
+                web = False
         if web:
             w = self.yaweb(stop)
             url = self._web_link(row, w)
@@ -1419,15 +1462,15 @@ class Engine:
     def _open_source(self, row, offset):
         """Поток файла с Яндекса с байта offset."""
         url, sess, web = self._link(row)
-        return self._open_link(row, url, sess, web, offset)
+        return self._open_link(row, url, sess, web, offset, patient=self.patient)
 
     @staticmethod
-    def _open_link(row, url, sess, web, offset, length=None):
+    def _open_link(row, url, sess, web, offset, length=None, patient=False):
         """Через сайт Яндекс вместо отказа иногда присылает страницу — такой ответ отбраковываем,
         но не для файлов, которые сами по себе .html/.json."""
         name, mime = (row.get("name") or "").lower(), (row.get("mime") or "").lower()
         textual = "html" in mime or "json" in mime or name.endswith((".html", ".htm", ".xhtml", ".json"))
-        return open_download(url, offset, sess=sess, reject_pages=web and not textual, length=length)
+        return open_download(url, offset, sess=sess, reject_pages=web and not textual, length=length, patient=patient)
 
     def _download_one(self, row, info):
         s = self.settings
@@ -1486,7 +1529,7 @@ class Engine:
         if not size:
             return b""
         tries = 0
-        guard = SpeedGuard(row["name"])
+        guard = SpeedGuard(row["name"], self.patient)
         while True:
             if stop.is_set():
                 raise Paused()
@@ -1517,7 +1560,7 @@ class Engine:
                 if isinstance(e, ApiError) and not e.retryable:
                     raise
                 tries += 1
-                if not got[0] or tries >= 3:
+                if (not got[0] and (not self.patient or tries >= 2)) or tries >= (6 if self.patient else 3):
                     raise _unavailable(e, tries)
                 self.log(f"Обрыв «{row['name']}»: {e} — сразу ещё раз", "warn")
                 if stop.wait(RETRY_PAUSE):
@@ -1546,7 +1589,7 @@ class Engine:
         except OSError as e:
             raise LocalDiskError(f"Буфер на диске: не удалось открыть {part}: {e}")
         ever, no_progress, tries = offset > 0, 0, 0   # докачка: файл уже отдавался — одна заминка не повод
-        guard = SpeedGuard(row["name"])
+        guard = SpeedGuard(row["name"], self.patient)
         info["done"] = offset
         try:
             while offset < size:
@@ -1594,7 +1637,7 @@ class Engine:
                         ever, no_progress = True, 0
                     else:
                         no_progress += 1
-                    if (not ever and no_progress) or no_progress >= 2 or tries > 30:
+                    if self._give_up(ever, no_progress, tries):
                         f.flush()
                         raise _unavailable(e, tries)
                     self.log(f"Обрыв «{row['name']}» на {offset / MB:.1f} МБ: {e}. Докачиваю с этого места", "warn")
@@ -1615,6 +1658,13 @@ class Engine:
         self.db.update_file(row["id"], status="buffered", local_path=final, note=None, last_error=None,
                             next_try=0)
         info["stage"] = "в буфере, MD5 сверен"
+
+    def _give_up(self, ever, no_progress, tries):
+        """Пора отложить файл, который Яндекс перестал отдавать посреди скачивания? В обычном проходе —
+        сразу, если байтов не было ни разу; в тщательном — только после нескольких пустых попыток подряд."""
+        if self.patient:
+            return (not ever and no_progress >= 2) or no_progress >= 4 or tries > 200
+        return (not ever and no_progress) or no_progress >= 2 or tries > 30
 
     def _transfer_direct(self, row, info, chunk):
         """Большой файл напрямую Яндекс → Google кусками; после сбоя — с подтверждённого Google байта.
@@ -1666,7 +1716,7 @@ class Engine:
                     want = min(chunk, size - offset)
                     info["stage"] = "Яндекс → Google напрямую"
                     base = offset
-                    guard = SpeedGuard(row["name"])   # меряем только чтение с Яндекса, не загрузку в Google
+                    guard = SpeedGuard(row["name"], self.patient)   # только чтение с Яндекса, не загрузка в Google
                     buf = read_exact(stream.raw, want, lambda n, d: (info.__setitem__("done", base + n),
                                                                      ya_got.__setitem__(0, ya_got[0] + d),
                                                                      self._add_speed("yandex", d),
@@ -1710,7 +1760,7 @@ class Engine:
                             ever, no_progress = True, 0
                         else:
                             no_progress += 1
-                        if (not ever and no_progress) or no_progress >= 2 or tries > 30:
+                        if self._give_up(ever, no_progress, tries):
                             raise _unavailable(e, tries)
                         delay = RETRY_PAUSE
                     self.log(f"Сбой при передаче «{row['name']}»: {e}. Продолжу с подтверждённого "
@@ -2247,28 +2297,26 @@ class Engine:
         prog = None
         batch = int(self.db.get("retry.batch") or 0)
         if batch:
-            by = {r["status"]: (r["n"], r["b"]) for r in self.db.q(
-                "SELECT status, COUNT(*) n, IFNULL(SUM(size),0) b FROM files WHERE retry_batch=? GROUP BY status",
-                (batch,))}
-            total = sum(n for n, _ in by.values())
-            done = by.get("done", (0, 0))[0] + by.get("skipped", (0, 0))[0]
-            again, errors = by.get("deferred", (0, 0))[0], by.get("error", (0, 0))[0]
-            left = total - done - again - errors
-            prog = {"at": batch, "auto": self.db.get("retry.auto") == "1", "total": total, "done": done,
-                    "done_bytes": by.get("done", (0, 0))[1], "deferred": again, "errors": errors, "left": left,
-                    "finished": left == 0 and not self.transferring()}
+            c = self._batch_counts(batch)
+            prog = dict(c, at=batch, auto=self.db.get("retry.auto") == "1",
+                        finished=c["left"] == 0 and not self.transferring())
         mode = self.settings["deferred_auto"]
         period = DEFERRED_AUTO.get(mode, 0)
         last = float(self.db.get("deferred.last_retry") or 0)
         since = float(self.db.get("deferred.auto_since") or 0)
+        th = self.thorough_info()
+        if th and not th["active"] and th["batch"] != batch:
+            th = None                         # после тщательного прохода был обычный повтор — показываем его
         return {"count": d.get("count", 0), "bytes": d.get("bytes", 0), "errors": er.get("count", 0),
-                "retry": prog, "auto": mode, "last_retry": last or None,
-                "next_auto": (max(last, since) + period) if period else None}
+                "retry": prog, "auto": mode, "auto_thorough": self.settings["deferred_auto_thorough"],
+                "last_retry": last or None, "next_auto": (max(last, since) + period) if period else None,
+                "thorough": th, "rounds": self.settings["thorough_rounds"],
+                "pause_min": self.settings["thorough_pause_min"]}
 
     def auto_retry_due(self, now=None):
         """Пора повторить отложенные по расписанию: задано расписание, есть что повторять, срок вышел."""
         period = DEFERRED_AUTO.get(self.settings["deferred_auto"], 0)
-        if not period or self.busy() or self.scanning():
+        if not period or self.busy() or self.scanning() or self.thorough_active():
             return False
         now = now or time.time()
         last = float(self.db.get("deferred.last_retry") or 0)
@@ -2277,6 +2325,98 @@ class Engine:
             return False
         return bool(self.db.q1("SELECT 1 FROM files WHERE status='deferred' OR (status='error' "
                                "AND IFNULL(note,'') != 'нет на Яндексе') LIMIT 1"))
+
+    # ================================================================== тщательный проход по отложенным
+    def thorough_active(self):
+        return self.db.get("thorough.active") == "1"
+
+    def thorough_start(self, rounds=None, pause_min=None, auto=False):
+        """«Тщательный проход»: отложенные (и ошибки) — снова в очередь, и несколько кругов по ним в терпеливом
+        режиме (start_transfer(patient=True)): дольше ждать Яндекс, до PATIENT_TRIES попыток на файл за круг,
+        каждая вторая — другим путём, медленные файлы не бросать, недокачанное докачивать. Между кругами —
+        пауза: серверы Яндекса оживают со временем. Круги запускает profiles.Manager (thorough_step)."""
+        if self.transferring():
+            raise ApiError("Сейчас идёт перенос — дождитесь его конца или нажмите «Пауза»")
+        upd = {}
+        if rounds:
+            upd["thorough_rounds"] = rounds
+        if pause_min:
+            upd["thorough_pause_min"] = pause_min
+        if upd:
+            self.settings.update(**upd)
+        rounds, pause = self.settings["thorough_rounds"], self.settings["thorough_pause_min"] * 60
+        n = self.retry_errors(auto=auto)
+        if not n:
+            raise ApiError("Отложенных файлов и ошибок нет — проходить нечего")
+        for k, v in (("batch", self.db.get("retry.batch")), ("round", 1), ("rounds", rounds), ("pause", pause),
+                     ("next", 0), ("total", n), ("auto", 1 if auto else 0), ("stopped", 0), ("active", 1)):
+            self.db.set("thorough." + k, v)
+        self.log(f"Тщательный проход по отложенным: {n} файлов, кругов — {rounds}, пауза между кругами — "
+                 f"{_dur(pause)}")
+        return n
+
+    def thorough_stop(self):
+        if not self.thorough_active():
+            return
+        self.db.set("thorough.active", 0)
+        self.db.set("thorough.next", 0)
+        self.db.set("thorough.stopped", 1)
+        if self.transferring() and self.patient:
+            self.pause_transfer()
+        self.log("Тщательный проход остановлен. Что не успели проверить — в очереди или в «Отложенных».")
+
+    def _batch_counts(self, batch):
+        by = {r["status"]: (r["n"], r["b"]) for r in self.db.q(
+            "SELECT status, COUNT(*) n, IFNULL(SUM(size),0) b FROM files WHERE retry_batch=? GROUP BY status",
+            (batch,))}
+        done = by.get("done", (0, 0))[0] + by.get("skipped", (0, 0))[0]
+        again, errors = by.get("deferred", (0, 0))[0], by.get("error", (0, 0))[0]
+        total = sum(n for n, _ in by.values())
+        return {"total": total, "done": done, "done_bytes": by.get("done", (0, 0))[1], "deferred": again,
+                "errors": errors, "left": total - done - again - errors}
+
+    def thorough_info(self):
+        batch = int(self.db.get("thorough.batch") or 0)
+        if not batch:
+            return None
+        c = self._batch_counts(batch)
+        nxt = float(self.db.get("thorough.next") or 0)
+        return dict(c, batch=batch, active=self.thorough_active(), round=int(self.db.get("thorough.round") or 1),
+                    rounds=int(self.db.get("thorough.rounds") or 1), pause=float(self.db.get("thorough.pause") or 0),
+                    next=nxt or None, started=int(self.db.get("thorough.total") or c["total"]),
+                    auto=self.db.get("thorough.auto") == "1", stopped=self.db.get("thorough.stopped") == "1",
+                    running=self.transferring() and self.patient)
+
+    def thorough_step(self, now=None):
+        """Между кругами (перенос не идёт): закончить круг, выждать паузу, вернуть ещё не отдавшиеся в очередь.
+        True — пора запускать следующий круг."""
+        if not self.thorough_active() or self.transferring() or self.scanning():
+            return False
+        now = now or time.time()
+        th = self.thorough_info()
+        if th["left"]:
+            return False                      # круг не закончен: перенос остановили — продолжит «Старт»
+        if th["round"] >= th["rounds"] or not th["deferred"]:
+            self.db.set("thorough.active", 0)
+            self.log(f"Тщательный проход завершён ({th['round']} из {th['rounds']} кругов): достали "
+                     f"{th['done']} из {th['started']}" + (f"; не отдались {th['deferred']} — остались в «Отложенных»"
+                                                           if th["deferred"] else " — всё"))
+            return False
+        if not th["next"]:
+            nxt = now + th["pause"]
+            self.db.set("thorough.next", nxt)
+            self.log(f"Тщательный проход: круг {th['round']} из {th['rounds']} закончен — достали {th['done']} из "
+                     f"{th['started']}, не отдались {th['deferred']}. Следующий круг — через {_dur(th['pause'])}")
+            return False
+        if now < th["next"]:
+            return False
+        self.db.x("UPDATE files SET status='pending', attempts=0, next_try=0 WHERE retry_batch=? AND status='deferred'",
+                  (th["batch"],))
+        self.db.set("thorough.round", th["round"] + 1)
+        self.db.set("thorough.next", 0)
+        self._stats_changed()
+        self.log(f"Тщательный проход: круг {th['round'] + 1} из {th['rounds']} — {th['deferred']} файлов")
+        return True
 
     # ================================================================== карта файлов: экспорт и импорт
     def export_map(self, dst):

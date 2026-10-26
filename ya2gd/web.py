@@ -259,7 +259,15 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/task/stop":
                 e.stop_task()
                 return self._send(200, {"ok": True})
+            if p == "/api/deferred/thorough":         # «Тщательный проход»: круги по отложенным
+                n = e.thorough_start(int(b.get("rounds") or 0), int(b.get("pause_min") or 0))
+                return self._send(200, dict(m.start(pid), n=n))
+            if p == "/api/deferred/thorough_stop":
+                e.thorough_stop()
+                return self._send(200, {"ok": True})
             if p == "/api/deferred/retry":            # «Повторить отложенные»: в очередь и сразу перенос
+                if e.thorough_active():
+                    raise ApiError("Идёт тщательный проход по отложенным — дождитесь его или остановите")
                 n = e.retry_errors()
                 r = m.start(pid) if n and not e.transferring() else {"ok": e.transferring(), "queued": False}
                 return self._send(200, dict(r, n=n))
