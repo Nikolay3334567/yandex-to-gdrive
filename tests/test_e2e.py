@@ -355,7 +355,7 @@ def scenario_buffer(e):
     app, M = e.app, e.M
     buf = os.path.join(e.ddir, "D-drive", "Буфер")
     app.start()
-    e.faults(rest_410=True, pu_hidden=True, slow=0.02, e504=["disk:/Много/Папка0/file0.bin"])
+    e.faults(rest_410=True, pu_hidden=True, slow=0.05, e504=["disk:/Много/Папка0/file0.bin"])
     code, r = app.post("/api/buffer/check", {"path": buf})
     assert code == 200 and "свободно" in r["msg"], r
     # единица буфера в тесте — 1 МБ: буфер 3 «ГБ» = 3 МБ, видео 5.5 МБ в него не влезает
@@ -376,12 +376,15 @@ def scenario_buffer(e):
     assert app.log_has("беру его через веб-версию Диска")
     print(f"OK список «Файлов» получен через веб-версию: {n} файлов")
 
+    # обрываем большой файл (от 1 МБ): маленький успевает докачаться целиком между проверкой и «убийством»
+    sizes = {str(it["id"]): it["size"] for it in app.get("/api/files?limit=500")["items"]}
     app.post("/api/transfer/start")
 
     def partial_part():
         for f in os.listdir(os.path.join(buf, "ya2gd-buffer")) if os.path.isdir(os.path.join(buf, "ya2gd-buffer")) else []:
             p = os.path.join(buf, "ya2gd-buffer", f)
-            if f.endswith(".part") and 300_000 < os.path.getsize(p):
+            full = sizes.get(f[:-5], 0)
+            if f.endswith(".part") and full >= 1_000_000 and 300_000 < os.path.getsize(p) < full - 300_000:
                 return p
     part = wait_for(partial_part, 120, "partial buffer download")
     size_before = os.path.getsize(part)
